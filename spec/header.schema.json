@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/nbms/0.1/header.schema.json",
+  "title": "NBMS Header",
+  "description": "JSON Schema for NBMS .nbmh header files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "version",
+    "id",
+    "title",
+    "artist",
+    "bpm",
+    "audio",
+    "charts",
+    "rights",
+    "security"
+  ],
+  "properties": {
+    "format": {
+      "const": "NBMS"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^0\\.1\\.\\d+$"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "subtitle": {
+      "type": "string"
+    },
+    "artist": {
+      "type": "string",
+      "minLength": 1
+    },
+    "genre": {
+      "type": "string"
+    },
+    "bpm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initial"
+      ],
+      "properties": {
+        "initial": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "min": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "max": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audioId",
+        "startMs",
+        "durationMs"
+      ],
+      "properties": {
+        "audioId": {
+          "$ref": "#/$defs/audioId"
+        },
+        "startMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "audio": {
+      "$ref": "#/$defs/fileReference"
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "hash"
+      ],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "hash": {
+          "$ref": "#/$defs/sha256Hash"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "charts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "file",
+          "mode",
+          "difficulty",
+          "levelName",
+          "hash",
+          "hashAlgorithm"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$"
+          },
+          "file": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "beat-5k",
+              "beat-7k",
+              "beat-10k",
+              "beat-14k",
+              "popn-9k",
+              "custom"
+            ]
+          },
+          "difficulty": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99
+          },
+          "levelName": {
+            "type": "string",
+            "minLength": 1
+          },
+          "hash": {
+            "$ref": "#/$defs/sha256Hash"
+          },
+          "hashAlgorithm": {
+            "const": "sha256-canonical-json"
+          }
+        }
+      }
+    },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "music",
+        "chart",
+        "soundSource",
+        "license"
+      ],
+      "properties": {
+        "music": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chart": {
+          "type": "string",
+          "minLength": 1
+        },
+        "soundSource": {
+          "type": "string",
+          "minLength": 1
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contact": {
+          "type": "string"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rightsEntry"
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signed",
+        "encrypted"
+      ],
+      "properties": {
+        "signed": {
+          "type": "boolean"
+        },
+        "encrypted": {
+          "type": "boolean"
+        },
+        "signatureAlgorithm": {
+          "type": "string",
+          "enum": [
+            "Ed25519"
+          ]
+        },
+        "publicKeyId": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        },
+        "editPolicy": {
+          "type": "string",
+          "enum": [
+            "open",
+            "signed-only",
+            "encrypted"
+          ],
+          "default": "open"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "audioId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "^(?:[a-zA-Z]:|/|\\\\|.*\\.\\.)"
+      }
+    },
+    "sha256Hash": {
+      "type": "string",
+      "pattern": "^sha256-[a-f0-9]{64}$"
+    },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "hash"
+      ],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "hash": {
+          "$ref": "#/$defs/sha256Hash"
+        }
+      }
+    },
+    "rightsEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "role",
+        "license"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "music",
+            "chart",
+            "sound-source",
+            "media",
+            "other"
+          ]
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

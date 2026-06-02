@@ -1,0 +1,65 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="using:NBMS.Studio.App.Controls"
+        x:Class="NBMS.Studio.App.Views.PlaybackWindow"
+        Width="980"
+        Height="760"
+        MinWidth="720"
+        MinHeight="540"
+        Title="NBMS Viewer">
+  <DockPanel Background="#111827">
+    <Border DockPanel.Dock="Top" Background="#1f2937" Padding="8">
+      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,24,*,Auto,Auto,Auto,Auto,Auto,Auto">
+        <Button Grid.Column="0" Content="{Binding PlaybackButtonText}" Click="Play_Click" MinWidth="80" Margin="0,0,8,0" />
+        <Button Grid.Column="1" Content="停止" Click="Stop_Click" MinWidth="72" Margin="0,0,8,0" />
+        <Button Grid.Column="2" Content="最初に戻る" Click="Reset_Click" MinWidth="96" Margin="0,0,8,0" />
+        <Button Grid.Column="3" Content="{Binding PlaybackLogButtonText}" Click="ToggleLog_Click" MinWidth="88" />
+        <TextBlock Grid.Column="5"
+                   Text="{Binding ChartSummaryText}"
+                   Foreground="#e5e7eb"
+                   VerticalAlignment="Center"
+                   TextTrimming="CharacterEllipsis" />
+        <TextBlock Grid.Column="6"
+                   Text="{Binding PlaybackPositionText}"
+                   Foreground="#facc15"
+                   FontSize="18"
+                   FontWeight="SemiBold"
+                   VerticalAlignment="Center" />
+        <Button Grid.Column="7" Content="x1.0" Click="HiSpeed1_Click" MinWidth="48" Margin="12,0,4,0" />
+        <Button Grid.Column="8" Content="x1.5" Click="HiSpeed15_Click" MinWidth="48" Margin="0,0,4,0" />
+        <Button Grid.Column="9" Content="x2.0" Click="HiSpeed2_Click" MinWidth="48" Margin="0,0,4,0" />
+        <Button Grid.Column="10" Content="x3.0" Click="HiSpeed3_Click" MinWidth="48" Margin="0,0,4,0" />
+        <Button Grid.Column="11" Content="x4.0" Click="HiSpeed4_Click" MinWidth="48" />
+      </Grid>
+    </Border>
+
+    <Border Margin="10" Background="#050505" BorderBrush="#374151" BorderThickness="1">
+      <Grid x:Name="ViewerLayout" RowDefinitions="Auto,*,120">
+        <Border Grid.Row="0" Background="#111827" Padding="8">
+          <TextBlock Text="NBMS Viewer"
+                     FontWeight="SemiBold"
+                     Foreground="#f9fafb" />
+        </Border>
+        <controls:PlayfieldCanvas Grid.Row="1"
+                                  Items="{Binding Timeline}"
+                                  PlayheadTick="{Binding PlayheadTick}"
+                                  HiSpeed="{Binding ViewerHiSpeed}" />
+        <Border x:Name="PlaybackLogPanel"
+                Grid.Row="2"
+                Background="#020617"
+                BorderBrush="#374151"
+                BorderThickness="0,1,0,0"
+                Padding="8">
+          <ScrollViewer HorizontalScrollBarVisibility="Disabled"
+                        VerticalScrollBarVisibility="Auto">
+            <TextBlock Text="{Binding PlaybackLogText}"
+                       Foreground="#d1d5db"
+                       FontFamily="Consolas"
+                       FontSize="11"
+                       TextWrapping="NoWrap" />
+          </ScrollViewer>
+        </Border>
+      </Grid>
+    </Border>
+  </DockPanel>
+</Window>
