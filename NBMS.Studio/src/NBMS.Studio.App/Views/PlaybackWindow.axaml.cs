@@ -20,9 +20,12 @@ public sealed partial class PlaybackWindow : Window
         DataContext = viewModel;
     }
 
-    private void Play_Click(object? sender, RoutedEventArgs e)
+    private async void Play_Click(object? sender, RoutedEventArgs e)
     {
-        _viewModel?.StartPlayback();
+        if (_viewModel is not null)
+        {
+            await _viewModel.StartPlaybackAsync();
+        }
     }
 
     private void Stop_Click(object? sender, RoutedEventArgs e)

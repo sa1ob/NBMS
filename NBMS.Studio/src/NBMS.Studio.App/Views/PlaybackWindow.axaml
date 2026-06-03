@@ -36,9 +36,19 @@
     <Border Margin="10" Background="#050505" BorderBrush="#374151" BorderThickness="1">
       <Grid x:Name="ViewerLayout" RowDefinitions="Auto,*,120">
         <Border Grid.Row="0" Background="#111827" Padding="8">
-          <TextBlock Text="NBMS Viewer"
-                     FontWeight="SemiBold"
-                     Foreground="#f9fafb" />
+          <Grid ColumnDefinitions="Auto,16,*">
+            <TextBlock Grid.Column="0"
+                       Text="NBMS Viewer"
+                       FontWeight="SemiBold"
+                       Foreground="#f9fafb" />
+            <TextBlock Grid.Column="2"
+                       Text="{Binding PlaybackDebugText}"
+                       Foreground="#9ca3af"
+                       FontFamily="Consolas"
+                       FontSize="11"
+                       VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis" />
+          </Grid>
         </Border>
         <controls:PlayfieldCanvas Grid.Row="1"
                                   Items="{Binding Timeline}"

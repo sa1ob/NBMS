@@ -9,6 +9,11 @@ namespace NBMS.Studio.App.Controls;
 
 public sealed class PlayfieldCanvas : Control
 {
+    private const double SevenKeyPlayfieldWidth = 280.0;
+    private const double MinimumPlayfieldWidth = 220.0;
+    private const double TwoPlayerGapWidth = 20.0;
+    private const int TwoPlayerGapBeforeLaneIndex = 8;
+
     public static readonly StyledProperty<IEnumerable?> ItemsProperty =
         AvaloniaProperty.Register<PlayfieldCanvas, IEnumerable?>(nameof(Items));
 
@@ -18,7 +23,7 @@ public sealed class PlayfieldCanvas : Control
     public static readonly StyledProperty<double> HiSpeedProperty =
         AvaloniaProperty.Register<PlayfieldCanvas, double>(nameof(HiSpeed), 1.0);
 
-    private static readonly string[] PlayLanes =
+    private static readonly string[] SevenKeyLanes =
     [
         "scratch",
         "key1",
@@ -28,6 +33,26 @@ public sealed class PlayfieldCanvas : Control
         "key5",
         "key6",
         "key7"
+    ];
+
+    private static readonly string[] FourteenKeyLanes =
+    [
+        "scratch",
+        "key1",
+        "key2",
+        "key3",
+        "key4",
+        "key5",
+        "key6",
+        "key7",
+        "key8",
+        "key9",
+        "key10",
+        "key11",
+        "key12",
+        "key13",
+        "key14",
+        "scratch2"
     ];
 
     private static readonly SolidColorBrush BlackBrush = new(Color.Parse("#050505"));
@@ -91,29 +116,32 @@ public sealed class PlayfieldCanvas : Control
             return;
         }
 
-        var playfieldWidth = Math.Min(280, Math.Max(220, bounds.Width - 160));
+        var rows = GetCachedRows();
+        var lanes = ResolvePlayLanes(rows);
+        var playfieldWidth = ResolvePlayfieldWidth(bounds, lanes);
         var playfieldLeft = bounds.Left + (bounds.Width - playfieldWidth) / 2 - 18;
         var playfield = new Rect(playfieldLeft, bounds.Top + 8, playfieldWidth, bounds.Height - 58);
         var bgmStrip = new Rect(playfield.Right + 6, playfield.Top, 14, playfield.Height);
         var pixelsPerTick = ResolvePixelsPerTick();
 
-        DrawCabinet(context, bounds, playfield, bgmStrip);
+        DrawCabinet(context, bounds, playfield, bgmStrip, lanes);
         DrawMeasureLines(context, playfield, pixelsPerTick);
-        DrawEvents(context, playfield, bgmStrip, pixelsPerTick);
-        DrawReceptors(context, bounds, playfield);
+        DrawEvents(context, playfield, bgmStrip, pixelsPerTick, rows, lanes);
+        DrawReceptors(context, bounds, playfield, lanes);
     }
 
-    private static void DrawCabinet(DrawingContext context, Rect bounds, Rect playfield, Rect bgmStrip)
+    private static void DrawCabinet(DrawingContext context, Rect bounds, Rect playfield, Rect bgmStrip, IReadOnlyList<string> lanes)
     {
         context.DrawRectangle(BlackBrush, null, bounds);
         context.DrawRectangle(PlayfieldBrush, PlayfieldPen, playfield);
         context.DrawRectangle(BgmStripBrush, ThinLanePen, bgmStrip);
 
-        var laneWidth = playfield.Width / PlayLanes.Length;
-        for (var i = 0; i < PlayLanes.Length; i++)
+        var laneWidth = ResolveLaneWidth(playfield, lanes);
+        DrawLaneGap(context, playfield, lanes, laneWidth);
+        for (var i = 0; i < lanes.Count; i++)
         {
-            var lane = PlayLanes[i];
-            var x = playfield.Left + laneWidth * i;
+            var lane = lanes[i];
+            var x = ResolveLaneX(playfield, lanes, laneWidth, i);
             var rect = new Rect(x, playfield.Top, laneWidth, playfield.Height);
             context.DrawRectangle(ResolveLaneBrush(lane), null, rect);
             context.DrawLine(ThinLanePen, new Point(SnapLine(x), playfield.Top), new Point(SnapLine(x), playfield.Bottom));
@@ -129,22 +157,27 @@ public sealed class PlayfieldCanvas : Control
     {
         return lane switch
         {
-            "scratch" => ScratchLaneBrush,
-            "key1" or "key3" or "key5" or "key7" => WhiteLaneBrush,
-            "key2" or "key4" or "key6" => BlueLaneBrush,
+            "scratch" or "scratch2" => ScratchLaneBrush,
+            var key when IsWhiteKey(key) => WhiteLaneBrush,
+            var key when IsBlueKey(key) => BlueLaneBrush,
             _ => Brushes.Black
         };
     }
 
-    private void DrawEvents(DrawingContext context, Rect playfield, Rect bgmStrip, double pixelsPerTick)
+    private void DrawEvents(
+        DrawingContext context,
+        Rect playfield,
+        Rect bgmStrip,
+        double pixelsPerTick,
+        IReadOnlyList<TimelineRow> rows,
+        IReadOnlyList<string> lanes)
     {
-        var rows = GetCachedRows();
         if (rows.Count == 0)
         {
             return;
         }
 
-        var laneWidth = playfield.Width / PlayLanes.Length;
+        var laneWidth = ResolveLaneWidth(playfield, lanes);
         var judgeY = ResolveJudgeY(playfield);
         var visibleMinTick = PlayheadTick + (judgeY - playfield.Bottom - 32) / pixelsPerTick;
         var visibleMaxTick = PlayheadTick + (judgeY - playfield.Top + 32) / pixelsPerTick;
@@ -172,14 +205,14 @@ public sealed class PlayfieldCanvas : Control
                 continue;
             }
 
-            var laneIndex = Array.FindIndex(PlayLanes, lane => lane.Equals(row.Lane, StringComparison.OrdinalIgnoreCase));
+            var laneIndex = FindLaneIndex(lanes, row.Lane);
             if (laneIndex < 0)
             {
                 continue;
             }
 
             var y = EventToY(row.Tick, playfield, pixelsPerTick);
-            var x = playfield.Left + laneWidth * laneIndex + 4;
+            var x = ResolveLaneX(playfield, lanes, laneWidth, laneIndex) + 4;
             var rect = new Rect(x, Math.Round(y - 8), Math.Max(8, laneWidth - 8), 14);
             if (rect.Bottom < playfield.Top || rect.Top > playfield.Bottom)
             {
@@ -250,27 +283,105 @@ public sealed class PlayfieldCanvas : Control
     {
         return lane switch
         {
-            "scratch" => StartLineBrush,
-            "key1" or "key3" or "key5" or "key7" => WhiteObjectBrush,
-            "key2" or "key4" or "key6" => BlueObjectBrush,
+            "scratch" or "scratch2" => StartLineBrush,
+            var key when IsWhiteKey(key) => WhiteObjectBrush,
+            var key when IsBlueKey(key) => BlueObjectBrush,
             _ => BgmObjectBrush
         };
     }
 
-    private static void DrawReceptors(DrawingContext context, Rect bounds, Rect playfield)
+    private static void DrawReceptors(DrawingContext context, Rect bounds, Rect playfield, IReadOnlyList<string> lanes)
     {
         var receptorTop = playfield.Bottom + 8;
-        var laneWidth = playfield.Width / PlayLanes.Length;
+        var laneWidth = ResolveLaneWidth(playfield, lanes);
 
         context.DrawRectangle(PanelBrush, ReceptorPen, new Rect(playfield.Left - 8, receptorTop - 4, playfield.Width + 16, 44));
 
-        for (var i = 0; i < PlayLanes.Length; i++)
+        for (var i = 0; i < lanes.Count; i++)
         {
-            var x = playfield.Left + laneWidth * i + 3;
+            var x = ResolveLaneX(playfield, lanes, laneWidth, i) + 3;
             var rect = new Rect(x, receptorTop, laneWidth - 6, 34);
-            var brush = PlayLanes[i] == "scratch" ? BlueObjectBrush : ResolveLaneBrush(PlayLanes[i]);
+            var brush = lanes[i].StartsWith("scratch", StringComparison.OrdinalIgnoreCase) ? BlueObjectBrush : ResolveLaneBrush(lanes[i]);
             context.DrawRectangle(brush, ReceptorPen, rect);
         }
+    }
+
+    private static IReadOnlyList<string> ResolvePlayLanes(IEnumerable<TimelineRow> rows)
+    {
+        return rows.Any(row => row.Lane is "scratch2" or "key8" or "key9" or "key10" or "key11" or "key12" or "key13" or "key14")
+            ? FourteenKeyLanes
+            : SevenKeyLanes;
+    }
+
+    private static double ResolvePlayfieldWidth(Rect bounds, IReadOnlyList<string> lanes)
+    {
+        var sevenLaneWidth = SevenKeyPlayfieldWidth / SevenKeyLanes.Length;
+        var desiredWidth = lanes.Count > SevenKeyLanes.Length
+            ? sevenLaneWidth * lanes.Count + TwoPlayerGapWidth
+            : SevenKeyPlayfieldWidth;
+        return Math.Min(Math.Max(MinimumPlayfieldWidth, desiredWidth), Math.Max(MinimumPlayfieldWidth, bounds.Width - 120));
+    }
+
+    private static double ResolveLaneWidth(Rect playfield, IReadOnlyList<string> lanes)
+    {
+        var gap = ResolveLaneGap(lanes);
+        return Math.Max(8, (playfield.Width - gap) / lanes.Count);
+    }
+
+    private static double ResolveLaneX(Rect playfield, IReadOnlyList<string> lanes, double laneWidth, int index)
+    {
+        var gapOffset = lanes.Count > SevenKeyLanes.Length && index >= TwoPlayerGapBeforeLaneIndex
+            ? TwoPlayerGapWidth
+            : 0;
+        return playfield.Left + laneWidth * index + gapOffset;
+    }
+
+    private static double ResolveLaneGap(IReadOnlyList<string> lanes)
+    {
+        return lanes.Count > SevenKeyLanes.Length ? TwoPlayerGapWidth : 0;
+    }
+
+    private static void DrawLaneGap(DrawingContext context, Rect playfield, IReadOnlyList<string> lanes, double laneWidth)
+    {
+        if (lanes.Count <= SevenKeyLanes.Length)
+        {
+            return;
+        }
+
+        var x = playfield.Left + laneWidth * TwoPlayerGapBeforeLaneIndex;
+        context.DrawRectangle(BlackBrush, null, new Rect(x, playfield.Top, TwoPlayerGapWidth, playfield.Height));
+        context.DrawLine(PlayfieldPen, new Point(SnapLine(x), playfield.Top), new Point(SnapLine(x), playfield.Bottom));
+        context.DrawLine(PlayfieldPen, new Point(SnapLine(x + TwoPlayerGapWidth), playfield.Top), new Point(SnapLine(x + TwoPlayerGapWidth), playfield.Bottom));
+    }
+
+    private static int FindLaneIndex(IReadOnlyList<string> lanes, string lane)
+    {
+        for (var index = 0; index < lanes.Count; index++)
+        {
+            if (lanes[index].Equals(lane, StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool IsWhiteKey(string lane)
+    {
+        return TryGetKeyNumber(lane, out var key) && key % 2 == 1;
+    }
+
+    private static bool IsBlueKey(string lane)
+    {
+        return TryGetKeyNumber(lane, out var key) && key % 2 == 0;
+    }
+
+    private static bool TryGetKeyNumber(string lane, out int key)
+    {
+        key = 0;
+        return lane.StartsWith("key", StringComparison.OrdinalIgnoreCase) &&
+               int.TryParse(lane[3..], out key);
     }
 
     private List<TimelineRow> GetCachedRows()

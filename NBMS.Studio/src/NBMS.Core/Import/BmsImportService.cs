@@ -18,7 +18,15 @@ public sealed partial class BmsImportService
         ["15"] = "key5",
         ["16"] = "scratch",
         ["18"] = "key6",
-        ["19"] = "key7"
+        ["19"] = "key7",
+        ["21"] = "key8",
+        ["22"] = "key9",
+        ["23"] = "key10",
+        ["24"] = "key11",
+        ["25"] = "key12",
+        ["26"] = "scratch2",
+        ["28"] = "key13",
+        ["29"] = "key14"
     };
 
     private static readonly Dictionary<string, string> LongNoteChannels = new()
@@ -30,7 +38,15 @@ public sealed partial class BmsImportService
         ["55"] = "key5",
         ["56"] = "scratch",
         ["58"] = "key6",
-        ["59"] = "key7"
+        ["59"] = "key7",
+        ["61"] = "key8",
+        ["62"] = "key9",
+        ["63"] = "key10",
+        ["64"] = "key11",
+        ["65"] = "key12",
+        ["66"] = "scratch2",
+        ["68"] = "key13",
+        ["69"] = "key14"
     };
 
     private static readonly string[] BackgroundLanes =
@@ -128,7 +144,8 @@ public sealed partial class BmsImportService
     {
         var measureStarts = BuildMeasureStarts(doc);
         var wavToAudioId = doc.Wav.ToDictionary(pair => pair.Key, pair => CreateAudioId(pair.Key, pair.Value), StringComparer.Ordinal);
-        var chart = CreateBaseChart(doc);
+        var mode = ResolveMode(doc);
+        var chart = CreateBaseChart(doc, mode);
         var backgroundLaneCountsByTick = new Dictionary<int, int>();
         var longNoteStarts = new Dictionary<string, PendingLongNote>(StringComparer.Ordinal);
         var lnObjStarts = new Dictionary<string, PendingLongNote>(StringComparer.Ordinal);
@@ -199,7 +216,7 @@ public sealed partial class BmsImportService
                 {
                     Id = "main",
                     File = "score/main.nbmc",
-                    Mode = "beat-7k",
+                    Mode = mode,
                     Difficulty = doc.PlayLevel,
                     LevelName = "main"
                 }
@@ -217,32 +234,14 @@ public sealed partial class BmsImportService
         return new BmsImportResult(header, chart, doc.Wav);
     }
 
-    private static NbmsChart CreateBaseChart(BmsImportDocument doc)
+    private static NbmsChart CreateBaseChart(BmsImportDocument doc, string mode)
     {
         return new NbmsChart
         {
             ChartId = "main",
-            Mode = "beat-7k",
+            Mode = mode,
             Resolution = Resolution,
-            Lanes =
-            [
-                new() { Id = "scratch", Type = "scratch", Index = 0 },
-                new() { Id = "key1", Type = "key", Index = 1 },
-                new() { Id = "key2", Type = "key", Index = 2 },
-                new() { Id = "key3", Type = "key", Index = 3 },
-                new() { Id = "key4", Type = "key", Index = 4 },
-                new() { Id = "key5", Type = "key", Index = 5 },
-                new() { Id = "key6", Type = "key", Index = 6 },
-                new() { Id = "key7", Type = "key", Index = 7 },
-                new() { Id = "background1", Type = "background-audio", Index = 8 },
-                new() { Id = "background2", Type = "background-audio", Index = 9 },
-                new() { Id = "background3", Type = "background-audio", Index = 10 },
-                new() { Id = "background4", Type = "background-audio", Index = 11 },
-                new() { Id = "background5", Type = "background-audio", Index = 12 },
-                new() { Id = "background6", Type = "background-audio", Index = 13 },
-                new() { Id = "background7", Type = "background-audio", Index = 14 },
-                new() { Id = "background8", Type = "background-audio", Index = 15 }
-            ],
+            Lanes = CreateLanes(mode),
             Timing =
             [
                 new() { Tick = 0, Type = "bpm", Value = doc.Bpm }
@@ -335,11 +334,67 @@ public sealed partial class BmsImportService
 
         if (!string.IsNullOrWhiteSpace(doc.LnObj))
         {
+            if (starts.Remove(lane, out var previous))
+            {
+                chart.Notes.Add(new NoteEvent
+                {
+                    Tick = previous.Tick,
+                    Lane = previous.Lane,
+                    Type = "tap",
+                    AudioId = previous.AudioId
+                });
+            }
+
             starts[lane] = new PendingLongNote(tick, lane, audioId);
             return;
         }
 
         chart.Notes.Add(new NoteEvent { Tick = tick, Lane = lane, Type = "tap", AudioId = audioId });
+    }
+
+    private static List<LaneDefinition> CreateLanes(string mode)
+    {
+        var lanes = new List<LaneDefinition>();
+        if (mode == "beat-14k")
+        {
+            lanes.Add(new LaneDefinition { Id = "scratch", Type = "scratch", Index = 0 });
+            for (var key = 1; key <= 14; key++)
+            {
+                lanes.Add(new LaneDefinition { Id = $"key{key}", Type = "key", Index = key });
+            }
+
+            lanes.Add(new LaneDefinition { Id = "scratch2", Type = "scratch", Index = 15 });
+        }
+        else
+        {
+            lanes.Add(new LaneDefinition { Id = "scratch", Type = "scratch", Index = 0 });
+            for (var key = 1; key <= 7; key++)
+            {
+                lanes.Add(new LaneDefinition { Id = $"key{key}", Type = "key", Index = key });
+            }
+        }
+
+        var backgroundStartIndex = lanes.Count;
+        for (var index = 0; index < BackgroundLanes.Length; index++)
+        {
+            lanes.Add(new LaneDefinition
+            {
+                Id = BackgroundLanes[index],
+                Type = "background-audio",
+                Index = backgroundStartIndex + index
+            });
+        }
+
+        return lanes;
+    }
+
+    private static string ResolveMode(BmsImportDocument doc)
+    {
+        return doc.ChannelLines.Any(line =>
+            NoteChannels.TryGetValue(line.Channel, out var lane) && lane is "scratch2" or "key8" or "key9" or "key10" or "key11" or "key12" or "key13" or "key14" ||
+            LongNoteChannels.TryGetValue(line.Channel, out var longLane) && longLane is "scratch2" or "key8" or "key9" or "key10" or "key11" or "key12" or "key13" or "key14")
+            ? "beat-14k"
+            : "beat-7k";
     }
 
     private static Dictionary<int, int> BuildMeasureStarts(BmsImportDocument doc)

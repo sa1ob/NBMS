@@ -20,11 +20,14 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     };
     private readonly Stopwatch _playbackClock = new();
     private readonly NbmsAudioPlayer _audioPlayer = new();
+    private readonly PlaybackLookaheadScheduler _playbackScheduler = new();
     private readonly Queue<string> _playbackLogLines = [];
 
     private NbmsProject? _project;
     private LoadedChart? _selectedChart;
     private NbmsAudioCache? _audioCache;
+    private Task<NbmsAudioCache?>? _audioCacheTask;
+    private PlaybackSession? _playbackSession;
     private List<PlaybackEvent> _playbackEvents = [];
     private List<TimelineRow> _playbackTimeline = [];
     private HashSet<(int Tick, long TimeKey)> _playbackStopPoints = [];
@@ -33,6 +36,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private double _playbackOffsetSeconds;
     private double _lastPlaybackPositionTextSeconds = -1;
     private const double UnknownAudioTailSeconds = 120.0;
+    private const double PlaybackLookaheadSeconds = 0.0;
     private string _statusText = "NBMS Studio を起動しました。";
     private string _titleText = "";
     private string _artistText = "";
@@ -52,6 +56,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private double _editorTimelineHeight = 2400;
     private double _viewerHiSpeed = 1.0;
     private string _playbackPositionText = "00:00.000";
+    private string _playbackDebugText = "session: none";
     private string _playbackLogText = "";
     private bool _isPlaybackLogVisible = true;
 
@@ -203,6 +208,12 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         set => SetProperty(ref _playbackPositionText, value);
     }
 
+    public string PlaybackDebugText
+    {
+        get => _playbackDebugText;
+        set => SetProperty(ref _playbackDebugText, value);
+    }
+
     public string PlaybackLogText
     {
         get => _playbackLogText;
@@ -269,10 +280,11 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StopPlayback();
         _audioCache?.Dispose();
         _audioCache = null;
+        _audioCacheTask = null;
 
         _project = await _projectService.OpenHeaderAsync(headerPath);
         _selectedChart = _project.Charts.FirstOrDefault();
-        PrepareAudioCache();
+        StartAudioCacheWarmup(_project);
 
         LoadHeaderFields();
         RefreshCollections();
@@ -433,7 +445,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StatusText = "選択ノーツを削除しました。";
     }
 
-    public void StartPlayback()
+    public async Task StartPlaybackAsync()
     {
         if (IsPlaying)
         {
@@ -450,8 +462,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         if (_audioCache is null)
         {
-            AppendPlaybackLog("PLAY", "prepare audio cache");
-            PrepareAudioCache();
+            AppendPlaybackLog("PLAY", "wait audio cache");
+            StatusText = "音源キャッシュを準備しています...";
+            await EnsureAudioCacheAsync();
         }
 
         if (_audioCache is null)
@@ -465,9 +478,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         BuildPlaybackSchedule();
         AppendPlaybackLog(
             "PLAY",
-            $"schedule events={_playbackEvents.Count} timeline={_playbackTimeline.Count} end={_playbackEndSeconds:0.000}s offset={_playbackOffsetSeconds:0.000}s");
+            $"schedule events={_playbackSession?.Events.Count ?? 0} timeline={_playbackSession?.TimelineMap.Points.Count ?? 0} assets={_playbackSession?.AssetPlan.Count ?? 0} end={_playbackSession?.EndSeconds ?? 0:0.000}s offset={_playbackOffsetSeconds:0.000}s");
 
-        if (_playbackEvents.Count == 0)
+        if (_playbackSession is null || _playbackSession.Events.Count == 0)
         {
             StatusText = "再生対象の音声イベントがありません。";
             AppendPlaybackLog("PLAY", "start failed: no playback events");
@@ -475,11 +488,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
 
         _audioPlayer.StopAll();
-        _nextPlaybackEventIndex = _playbackEvents.FindIndex(item => item.TimeSeconds >= _playbackOffsetSeconds);
-        if (_nextPlaybackEventIndex < 0)
-        {
-            _nextPlaybackEventIndex = _playbackEvents.Count;
-        }
+        _audioPlayer.ClearPreloaded();
+        _playbackScheduler.Reset(_playbackSession, _playbackOffsetSeconds);
+        _nextPlaybackEventIndex = _playbackScheduler.NextEventIndex;
 
         PlayheadTick = EstimateTickAt(_playbackOffsetSeconds);
         PlaybackPositionText = TimeSpan.FromSeconds(_playbackOffsetSeconds).ToString(@"mm\:ss\.fff");
@@ -489,6 +500,11 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         AppendPlaybackLog("PLAY", $"start next={_nextPlaybackEventIndex} tick={PlayheadTick:0.##}");
         _playbackClock.Restart();
         _playbackTimer.Start();
+    }
+
+    public void StartPlayback()
+    {
+        _ = StartPlaybackAsync();
     }
 
     public void StopPlayback()
@@ -528,10 +544,12 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         _playbackClock.Reset();
         _audioPlayer.StopAll();
         _nextPlaybackEventIndex = 0;
+        _playbackScheduler.Clear();
         _playbackOffsetSeconds = 0;
         IsPlaying = false;
         PlayheadTick = 0;
         PlaybackPositionText = "00:00.000";
+        PlaybackDebugText = "session: none";
         _lastPlaybackPositionTextSeconds = -1;
         OnPropertyChanged(nameof(PlaybackButtonText));
     }
@@ -551,19 +569,70 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         LicenseText = _project.Header.Rights.License;
     }
 
-    private void PrepareAudioCache()
+    private void StartAudioCacheWarmup(NbmsProject project)
     {
-        if (_project?.AudioManifest is null)
+        _audioCacheTask = CreateAudioCacheAsync(project);
+        _ = CompleteAudioCacheWarmupAsync(project, _audioCacheTask);
+    }
+
+    private async Task CompleteAudioCacheWarmupAsync(NbmsProject project, Task<NbmsAudioCache?> task)
+    {
+        try
+        {
+            var cache = await task;
+            if (ReferenceEquals(_project, project) && _audioCache is null)
+            {
+                _audioCache = cache;
+                return;
+            }
+
+            if (!ReferenceEquals(_audioCache, cache))
+            {
+                cache?.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendPlaybackLog("AUDIO", $"cache warmup failed: {ex.Message}");
+        }
+    }
+
+    private async Task EnsureAudioCacheAsync()
+    {
+        if (_audioCache is not null)
         {
             return;
         }
 
-        var audioPath = Path.GetFullPath(Path.Combine(
-            _project.RootDirectory,
-            _project.Header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
+        if (_project is null)
+        {
+            return;
+        }
 
-        _audioCache?.Dispose();
-        _audioCache = NbmsAudioCache.Create(audioPath, _project.AudioManifest);
+        _audioCacheTask ??= CreateAudioCacheAsync(_project);
+        var cache = await _audioCacheTask;
+        if (_audioCache is null)
+        {
+            _audioCache = cache;
+        }
+        else if (!ReferenceEquals(_audioCache, cache))
+        {
+            cache?.Dispose();
+        }
+    }
+
+    private static Task<NbmsAudioCache?> CreateAudioCacheAsync(NbmsProject project)
+    {
+        if (project.AudioManifest is null)
+        {
+            return Task.FromResult<NbmsAudioCache?>(null);
+        }
+
+        var audioPath = Path.GetFullPath(Path.Combine(
+            project.RootDirectory,
+            project.Header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
+
+        return Task.Run<NbmsAudioCache?>(() => NbmsAudioCache.Create(audioPath, project.AudioManifest));
     }
 
     private void ApplyHeaderFields()
@@ -697,6 +766,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         _playbackEvents = [];
         _playbackTimeline = [];
         _playbackStopPoints = [];
+        _playbackSession = null;
         _lastPlaybackPositionTextSeconds = -1;
 
         if (_selectedChart is null)
@@ -704,58 +774,13 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var timelineItems = _timelineService.BuildTimeline(_selectedChart.Chart);
-        _playbackTimeline = timelineItems
-            .Select(item => new TimelineRow
-            {
-                Tick = item.Tick,
-                TimeSeconds = item.TimeSeconds,
-                Kind = item.Kind,
-                Lane = item.Lane,
-                Detail = item.Detail
-            })
-            .OrderBy(row => row.TimeSeconds)
-            .ThenBy(row => row.Tick)
-            .ToList();
-        _playbackStopPoints = _playbackTimeline
-            .Where(item =>
-                item.Kind.Equals("Timing", StringComparison.OrdinalIgnoreCase) &&
-                item.Detail.StartsWith("STOP", StringComparison.OrdinalIgnoreCase))
-            .Select(item => (item.Tick, TimeKey: ToPlaybackTimeKey(item.TimeSeconds)))
-            .ToHashSet();
-
-        var audioDurations = (_project?.AudioManifest?.Entries ?? [])
-            .ToDictionary(entry => entry.AudioId, entry => entry.DurationMs / 1000.0, StringComparer.Ordinal);
-
-        foreach (var item in timelineItems.Where(item => item.Kind == "Note" || item.Kind == "BGM"))
-        {
-            var audioId = ResolveAudioId(item);
-            if (string.IsNullOrWhiteSpace(audioId))
-            {
-                continue;
-            }
-
-            _playbackEvents.Add(new PlaybackEvent
-            {
-                TimeSeconds = item.TimeSeconds,
-                Tick = item.Tick,
-                Kind = item.Kind,
-                Lane = item.Lane,
-                AudioId = audioId,
-                DurationSeconds = audioDurations.GetValueOrDefault(audioId)
-            });
-        }
-
-        _playbackEvents = _playbackEvents
-            .OrderBy(item => item.TimeSeconds)
-            .ThenBy(item => item.Tick)
-            .ToList();
-
-        var lastTimelineSeconds = _playbackTimeline.Count == 0 ? 0 : _playbackTimeline.Max(item => item.TimeSeconds);
-        var lastAudioSeconds = _playbackEvents.Count == 0
-            ? 0
-            : _playbackEvents.Max(item => item.TimeSeconds + ResolvePlaybackTailSeconds(item));
-        _playbackEndSeconds = Math.Max(lastTimelineSeconds, lastAudioSeconds);
+        _playbackSession = PlaybackSession.Create(
+            _selectedChart.Chart,
+            _project?.AudioManifest,
+            _timelineService,
+            _audioCache?.DurationsByAudioId);
+        _playbackEndSeconds = _playbackSession.EndSeconds;
+        UpdatePlaybackDebugText(_playbackOffsetSeconds);
     }
 
     private static double ResolvePlaybackTailSeconds(PlaybackEvent playbackEvent)
@@ -804,11 +829,19 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         PlayheadTick = EstimateTickAt(elapsedSeconds);
 
-        while (_nextPlaybackEventIndex < _playbackEvents.Count &&
-               _playbackEvents[_nextPlaybackEventIndex].TimeSeconds <= elapsedSeconds)
+        if (_playbackSession is not null)
         {
-            PlayPlaybackEvent(_playbackEvents[_nextPlaybackEventIndex]);
-            _nextPlaybackEventIndex++;
+            foreach (var playbackEvent in _playbackScheduler.Poll(elapsedSeconds, PlaybackLookaheadSeconds))
+            {
+                PlayPlaybackEvent(playbackEvent, elapsedSeconds);
+            }
+
+            _nextPlaybackEventIndex = _playbackScheduler.NextEventIndex;
+        }
+
+        if (_lastPlaybackPositionTextSeconds < 0 || Math.Abs(elapsedSeconds - _lastPlaybackPositionTextSeconds) < 0.0001)
+        {
+            UpdatePlaybackDebugText(elapsedSeconds);
         }
 
         if (elapsedSeconds >= _playbackEndSeconds)
@@ -826,14 +859,16 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         _playbackOffsetSeconds = 0;
         IsPlaying = false;
         _nextPlaybackEventIndex = 0;
+        _playbackScheduler.Clear();
         PlayheadTick = 0;
         PlaybackPositionText = "00:00.000";
+        PlaybackDebugText = "session: finished";
         _lastPlaybackPositionTextSeconds = -1;
         OnPropertyChanged(nameof(PlaybackButtonText));
         // 末尾の音やフェードアウトを切らないため、ここではミキサーを停止しない。
     }
 
-    private void PlayPlaybackEvent(PlaybackEvent playbackEvent)
+    private void PlayPlaybackEvent(AudioScheduleEvent playbackEvent, double elapsedSeconds)
     {
         if (_audioCache is null)
         {
@@ -851,8 +886,16 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         {
             AppendPlaybackLog(
                 "EVENT",
-                $"{playbackEvent.TimeSeconds:0.000}s tick={playbackEvent.Tick} {playbackEvent.Kind}/{playbackEvent.Lane} {playbackEvent.AudioId}");
-            _audioPlayer.PlayOneShot(filePath);
+                $"{playbackEvent.TimeSeconds:0.000}s tick={playbackEvent.Tick} delay={Math.Max(0, playbackEvent.TimeSeconds - elapsedSeconds):0.000}s {playbackEvent.Kind}/{playbackEvent.Lane} {playbackEvent.AudioId}");
+            if (_audioPlayer.PlayPreloadedOneShot(playbackEvent.AudioId, playbackEvent.TimeSeconds - elapsedSeconds))
+            {
+                AppendPlaybackLog("EVENT", $"route=preloaded {playbackEvent.AudioId}");
+            }
+            else
+            {
+                AppendPlaybackLog("EVENT", $"route=stream {playbackEvent.AudioId} file={Path.GetFileName(filePath)}");
+                _audioPlayer.PlayOneShot(filePath, playbackEvent.TimeSeconds - elapsedSeconds);
+            }
         }
         catch (Exception ex)
         {
@@ -863,55 +906,32 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     private double EstimateTickAt(double elapsedSeconds)
     {
-        if (_playbackTimeline.Count == 0)
+        return _playbackSession?.EstimateTickAt(elapsedSeconds) ?? 0;
+    }
+
+    private void PreloadPlaybackAssets()
+    {
+        if (_playbackSession is null || _audioCache is null)
         {
-            return 0;
+            return;
         }
 
-        if (elapsedSeconds <= _playbackTimeline[0].TimeSeconds)
+        var requests = new List<PlaybackPreloadRequest>();
+        foreach (var asset in _playbackSession.AssetPlan.Where(asset => asset.Mode == PlaybackAssetLoadMode.Preload))
         {
-            return _playbackTimeline[0].Tick;
-        }
-
-        var left = 0;
-        var right = _playbackTimeline.Count - 1;
-        while (left <= right)
-        {
-            var middle = left + (right - left) / 2;
-            if (_playbackTimeline[middle].TimeSeconds <= elapsedSeconds)
+            if (_audioCache.TryGetFilePath(asset.AudioId, out var filePath))
             {
-                left = middle + 1;
-            }
-            else
-            {
-                right = middle - 1;
+                requests.Add(new PlaybackPreloadRequest(asset.AudioId, filePath));
             }
         }
 
-        var previousIndex = Math.Clamp(right, 0, _playbackTimeline.Count - 1);
-        if (previousIndex >= _playbackTimeline.Count - 1)
+        if (requests.Count == 0)
         {
-            var tail = _playbackTimeline[^1];
-            var tailSeconds = Math.Max(0, elapsedSeconds - tail.TimeSeconds);
-            var ticksPerSecond = ResolveInitialTicksPerSecond();
-            return tail.Tick + tailSeconds * ticksPerSecond;
+            return;
         }
 
-        var previous = _playbackTimeline[previousIndex];
-        var next = _playbackTimeline[previousIndex + 1];
-        var span = next.TimeSeconds - previous.TimeSeconds;
-        if (span <= 0)
-        {
-            return next.Tick;
-        }
-
-        if (HasStopAt(previous.Tick, previous.TimeSeconds))
-        {
-            return previous.Tick;
-        }
-
-        var ratio = Math.Clamp((elapsedSeconds - previous.TimeSeconds) / span, 0, 1);
-        return previous.Tick + (next.Tick - previous.Tick) * ratio;
+        AppendPlaybackLog("PLAY", $"preload assets={requests.Count}");
+        _audioPlayer.Preload(requests);
     }
 
     private bool HasStopAt(int tick, double timeSeconds)
@@ -959,6 +979,18 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
 
         PlaybackLogText = string.Join(Environment.NewLine, _playbackLogLines);
+    }
+
+    private void UpdatePlaybackDebugText(double elapsedSeconds)
+    {
+        if (_playbackSession is null)
+        {
+            PlaybackDebugText = "session: none";
+            return;
+        }
+
+        PlaybackDebugText =
+            $"events {_nextPlaybackEventIndex}/{_playbackSession.Events.Count}  assets {_playbackSession.AssetPlan.Count}  lookahead {PlaybackLookaheadSeconds * 1000:0}ms  tick {PlayheadTick:0.##}  end {_playbackSession.EndSeconds:0.000}s  t {elapsedSeconds:0.000}s";
     }
 
     private void ApplyNoteRows()

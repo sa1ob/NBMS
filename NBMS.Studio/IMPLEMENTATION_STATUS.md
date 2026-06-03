@@ -71,7 +71,7 @@
 ## 再生安定化
 
 - DispatcherTimerで再生位置を確認し、発音時刻を過ぎたイベントを即時OneShot再生する
-- 音声キャッシュ済みPCM / OffsetSampleProvider方式を外した
+- 以前の音声キャッシュ済みPCM再生方式を外し、発音直前Reader方式をベースに整理
 - MediaFoundationReaderを発音ごとに開く安定寄りの実装へ戻した
 - 同時発音時の破綻を抑えるため、OneShot音量を控えめにした
 - 過大入力時のみソフトクリップする形へ調整
@@ -84,6 +84,27 @@
 - PlayfieldCanvasはTimeline行をコレクション変更時だけキャッシュ
 - 描画時は画面内tick範囲だけを処理
 - Viewer描画でBrush/Penを毎フレーム生成しないよう静的インスタンスを再利用
+- `PlaybackSession` / `PlaybackTimelineMap` / `AudioScheduleEvent` を追加し、Viewer再生モデルをViewModelから分離
+- `PlaybackLookaheadScheduler` を追加し、将来のaudio master clock / lookahead予約へ移行できる入口を作成
+- Viewer上部に軽量debug overlayを追加し、イベントカーソル、asset数、tick、曲終端時刻を表示
+- Viewer発音を100ms lookaheadへ変更し、音声Reader生成を発音予定時刻より前に開始
+- `NbmsAudioPlayer.PlayOneShot(filePath, delaySeconds)` を追加し、残り待ち時間は `OffsetSampleProvider` の無音delayで調整
+- 短音向けpreload cacheを追加し、8秒以下の使用音源は再生開始前にPCMへdecodeして発音時のReader生成を回避
+- preload済み音源は `PreloadedSampleProvider` から再生し、長音やduration不明音源は従来のReader方式でstream寄りに扱う
+- OGG/Vorbis音源はplayable noteで使われるduration不明音源のみpreload優先に変更し、長いBGMの無制限PCM展開を回避
+- preload decodeに12秒上限を追加し、長い音源はstream fallbackへ戻す
+- lookaheadを250msへ拡大し、Reader準備やpreload発音の余裕を増やした
+- 同時発音時の割れ軽減のためOneShot音量を0.30へ下げた
+- Viewerログに `route=preloaded` / `route=stream` を出し、発音経路を確認できるようにした
+- `.ogg` / `.oga` は外部codecではなく `NAudio.Vorbis` でdecodeする方針を維持
+- `DurationMs == 0` の音源は展開後の実ファイルからdurationを読み、PlaybackSessionの終端判定とpreload/stream分類へ反映
+- OGG/OGAは `.nbma` 展開時に一時WAVへdecodeし、Viewer再生中はVorbis stream decodeを避けるよう変更
+- AudioPlayerの `_gate` 保持中に `MixingSampleProvider.AddMixerInput` / `RemoveAllMixerInputs` / source disposeを呼ばないよう修正し、音声スレッドとのデッドロックを回避
+- `AutoDisposeSampleProvider` / `PreloadedSampleProvider` のDisposeをスレッドセーフ化
+- 先読み発音による曲頭スクロール/再生の崩れを避けるため、Viewerのlookaheadを0msへ戻した
+- preload cacheは実装を残しつつ、再生開始時のpreload呼び出しを一旦停止
+- `.nbmh` 読み込み時の音源展開/OGG一時WAV化を停止し、音源キャッシュ作成は再生開始時のみ行う
+- `.nbmh` 読み込み後に音源キャッシュ作成をバックグラウンドで開始し、初回再生ボタン押下時の待ち時間を軽減
 
 ## BMS変換
 
@@ -104,10 +125,16 @@
 - STOPはTimeline / 再生側の時間計算へ反映
 - `#51-#59` の基本的なロングノートチャンネルを `hold` ノートへ変換
 - `#LNOBJ` 形式の終端オブジェクトを最小対応
+- 2P側チャンネル `#xxx21..29` とLN `#xxx61..69` を `key8..key14` / `scratch2` として変換
+- 2P側チャンネルを検出した譜面は `beat-14k` として出力
+- `#LNOBJ` 定義時に通常ノーツが消える問題を軽減するため、未確定LN開始候補を後続終端が来なければtapへ戻すよう修正
+- Editor / Viewerの14keys表示では1P側と2P側の間にギャップを追加
+- Viewerの14keys表示は7keys時のレーン幅を基準にプレイフィールド幅を広げるよう調整
 - `.ogg` は変換時に再エンコードせず `audio.nbma` へそのまま格納
 - manifest codecは `ogg-vorbis` として扱う
 - Viewer再生に `NAudio.Vorbis` を追加
 - `.ogg` は `VorbisWaveReader`、その他はMedia Foundationで読むよう分岐
+- 既知問題: 初回再生ボタン押下時は音源キャッシュ作成が走るため待ち時間が長い
 
 ## まだ未実装・未検討
 

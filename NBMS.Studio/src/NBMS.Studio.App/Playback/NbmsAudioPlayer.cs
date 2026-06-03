@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using NAudio.Vorbis;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
@@ -6,11 +7,15 @@ namespace NBMS.Studio.App.Playback;
 
 public sealed class NbmsAudioPlayer : IDisposable
 {
+    private const float OneShotVolume = 0.30f;
+    private const int MaxPreloadSeconds = 12;
+
     private readonly WaveOutEvent _output;
     private readonly MixingSampleProvider _mixer;
     private readonly WaveFormat _mixFormat = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
     private readonly List<IDisposable> _activeSources = [];
     private readonly Queue<PlaybackRequest> _pendingRequests = [];
+    private readonly Dictionary<string, PreloadedAudioClip> _preloadedClips = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _requestSignal = new(0);
     private readonly object _gate = new();
     private readonly Task _workerTask;
@@ -37,6 +42,11 @@ public sealed class NbmsAudioPlayer : IDisposable
 
     public void PlayOneShot(string filePath)
     {
+        PlayOneShot(filePath, delaySeconds: 0);
+    }
+
+    public void PlayOneShot(string filePath, double delaySeconds)
+    {
         lock (_gate)
         {
             if (_disposed)
@@ -44,31 +54,102 @@ public sealed class NbmsAudioPlayer : IDisposable
                 return;
             }
 
-            _pendingRequests.Enqueue(new PlaybackRequest(filePath, _generation));
+            _pendingRequests.Enqueue(new PlaybackRequest(
+                filePath,
+                _generation,
+                Math.Max(0, delaySeconds),
+                Stopwatch.GetTimestamp()));
         }
 
-        Log($"queue {Path.GetFileName(filePath)}");
+        Log($"queue {Path.GetFileName(filePath)} delay={Math.Max(0, delaySeconds):0.000}s");
         _requestSignal.Release();
+    }
+
+    public void Preload(IEnumerable<PlaybackPreloadRequest> requests)
+    {
+        foreach (var request in requests)
+        {
+            Preload(request);
+        }
+    }
+
+    public bool PlayPreloadedOneShot(string audioId, double delaySeconds)
+    {
+        PreloadedAudioClip clip;
+        lock (_gate)
+        {
+            if (_disposed || !_preloadedClips.TryGetValue(audioId, out clip))
+            {
+                return false;
+            }
+        }
+
+        var source = new PreloadedSampleProvider(clip.Samples, clip.WaveFormat, RemoveDisposedSource);
+        var volume = new VolumeSampleProvider(source)
+        {
+            Volume = OneShotVolume
+        };
+        ISampleProvider scheduledSample = volume;
+        var safeDelaySeconds = Math.Max(0, delaySeconds);
+        if (safeDelaySeconds > 0.001)
+        {
+            scheduledSample = new OffsetSampleProvider(volume)
+            {
+                DelayBy = TimeSpan.FromSeconds(safeDelaySeconds)
+            };
+        }
+
+        var shouldDispose = false;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                shouldDispose = true;
+            }
+            else
+            {
+                _activeSources.Add(source);
+            }
+        }
+
+        if (shouldDispose)
+        {
+            source.Dispose();
+            return false;
+        }
+
+        _mixer.AddMixerInput(scheduledSample);
+        Log($"add-preloaded {audioId} delay={safeDelaySeconds:0.000}s");
+        return true;
+    }
+
+    public void ClearPreloaded()
+    {
+        lock (_gate)
+        {
+            _preloadedClips.Clear();
+        }
     }
 
     public void StopAll()
     {
         var pendingCount = 0;
         var activeCount = 0;
+        List<IDisposable> sources;
         lock (_gate)
         {
             _generation++;
             pendingCount = _pendingRequests.Count;
             activeCount = _activeSources.Count;
             _pendingRequests.Clear();
-            _mixer.RemoveAllMixerInputs();
-
-            foreach (var source in _activeSources.ToArray())
-            {
-                source.Dispose();
-            }
-
+            sources = _activeSources.ToList();
             _activeSources.Clear();
+        }
+
+        _mixer.RemoveAllMixerInputs();
+        foreach (var source in sources)
+        {
+            source.Dispose();
         }
 
         if (pendingCount > 0 || activeCount > 0)
@@ -121,23 +202,42 @@ public sealed class NbmsAudioPlayer : IDisposable
 
             var volume = new VolumeSampleProvider(source)
             {
-                Volume = 0.45f
+                Volume = OneShotVolume
             };
+            var remainingDelaySeconds = ResolveRemainingDelaySeconds(request);
+            ISampleProvider scheduledSample = volume;
+            if (remainingDelaySeconds > 0.001)
+            {
+                scheduledSample = new OffsetSampleProvider(volume)
+                {
+                    DelayBy = TimeSpan.FromSeconds(remainingDelaySeconds)
+                };
+            }
 
+            var shouldDiscard = false;
             lock (_gate)
             {
                 if (_disposed || request.Generation != _generation)
                 {
                     Log($"discard {Path.GetFileName(request.FilePath)}");
-                    source.Dispose();
-                    return;
+                    shouldDiscard = true;
                 }
-
-                _activeSources.Add(source);
-                _mixer.AddMixerInput(volume);
-                source = null;
-                reader = null;
+                else
+                {
+                    _activeSources.Add(source);
+                }
             }
+
+            if (shouldDiscard)
+            {
+                source.Dispose();
+                return;
+            }
+
+            _mixer.AddMixerInput(scheduledSample);
+            Log($"add {Path.GetFileName(request.FilePath)} remainingDelay={remainingDelaySeconds:0.000}s");
+            source = null;
+            reader = null;
         }
         catch (Exception ex)
         {
@@ -147,11 +247,47 @@ public sealed class NbmsAudioPlayer : IDisposable
         }
     }
 
+    private void Preload(PlaybackPreloadRequest request)
+    {
+        lock (_gate)
+        {
+            if (_disposed || _preloadedClips.ContainsKey(request.AudioId))
+            {
+                return;
+            }
+        }
+
+        WaveStream? reader = null;
+        try
+        {
+            Log($"preload-open {request.AudioId} {Path.GetFileName(request.FilePath)}");
+            reader = CreateReader(request.FilePath);
+            var sample = NormalizeFormat(reader.ToSampleProvider());
+            var samples = ReadAllSamples(sample);
+            lock (_gate)
+            {
+                if (!_disposed)
+                {
+                    _preloadedClips[request.AudioId] = new PreloadedAudioClip(samples, _mixFormat);
+                    Log($"preload-ready {request.AudioId} samples={samples.Length}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"preload-failed {request.AudioId} {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            reader?.Dispose();
+        }
+    }
+
     private static WaveStream CreateReader(string filePath)
     {
         return Path.GetExtension(filePath).ToLowerInvariant() switch
         {
-            ".ogg" => new VorbisWaveReader(filePath),
+            ".ogg" or ".oga" => new VorbisWaveReader(filePath),
             _ => new MediaFoundationReader(filePath)
         };
     }
@@ -183,6 +319,33 @@ public sealed class NbmsAudioPlayer : IDisposable
         return result;
     }
 
+    private static float[] ReadAllSamples(ISampleProvider source)
+    {
+        var result = new List<float>();
+        var maxSamples = source.WaveFormat.SampleRate * source.WaveFormat.Channels * MaxPreloadSeconds;
+        var buffer = new float[source.WaveFormat.SampleRate * source.WaveFormat.Channels / 4];
+        while (true)
+        {
+            var read = source.Read(buffer, 0, buffer.Length);
+            if (read <= 0)
+            {
+                break;
+            }
+
+            if (result.Count + read > maxSamples)
+            {
+                throw new InvalidOperationException($"preload limit exceeded ({MaxPreloadSeconds}s)");
+            }
+
+            for (var i = 0; i < read; i++)
+            {
+                result.Add(buffer[i]);
+            }
+        }
+
+        return result.ToArray();
+    }
+
     public void Dispose()
     {
         lock (_gate)
@@ -198,7 +361,24 @@ public sealed class NbmsAudioPlayer : IDisposable
         _requestSignal.Dispose();
     }
 
-    private readonly record struct PlaybackRequest(string FilePath, int Generation);
+    private static double ResolveRemainingDelaySeconds(PlaybackRequest request)
+    {
+        if (request.DelaySeconds <= 0)
+        {
+            return 0;
+        }
+
+        var elapsedSeconds = (Stopwatch.GetTimestamp() - request.EnqueuedAtTicks) / (double)Stopwatch.Frequency;
+        return Math.Max(0, request.DelaySeconds - elapsedSeconds);
+    }
+
+    private readonly record struct PlaybackRequest(
+        string FilePath,
+        int Generation,
+        double DelaySeconds,
+        long EnqueuedAtTicks);
+
+    private readonly record struct PreloadedAudioClip(float[] Samples, WaveFormat WaveFormat);
 
     private void Log(string message)
     {
@@ -211,7 +391,7 @@ internal sealed class AutoDisposeSampleProvider : ISampleProvider, IDisposable
     private readonly ISampleProvider _source;
     private readonly IDisposable _disposable;
     private readonly Action<IDisposable> _onDisposed;
-    private bool _disposed;
+    private int _disposed;
 
     public AutoDisposeSampleProvider(ISampleProvider source, IDisposable disposable, Action<IDisposable> onDisposed)
     {
@@ -224,7 +404,7 @@ internal sealed class AutoDisposeSampleProvider : ISampleProvider, IDisposable
 
     public int Read(float[] buffer, int offset, int count)
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
         {
             return 0;
         }
@@ -240,13 +420,62 @@ internal sealed class AutoDisposeSampleProvider : ISampleProvider, IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
-        _disposed = true;
         _disposable.Dispose();
+        _onDisposed(this);
+    }
+}
+
+internal sealed class PreloadedSampleProvider : ISampleProvider, IDisposable
+{
+    private readonly float[] _samples;
+    private readonly Action<IDisposable> _onDisposed;
+    private int _position;
+    private int _disposed;
+
+    public PreloadedSampleProvider(float[] samples, WaveFormat waveFormat, Action<IDisposable> onDisposed)
+    {
+        _samples = samples;
+        WaveFormat = waveFormat;
+        _onDisposed = onDisposed;
+    }
+
+    public WaveFormat WaveFormat { get; }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return 0;
+        }
+
+        var available = _samples.Length - _position;
+        var read = Math.Min(count, available);
+        if (read > 0)
+        {
+            Array.Copy(_samples, _position, buffer, offset, read);
+            _position += read;
+        }
+
+        if (read == 0 || _position >= _samples.Length)
+        {
+            Dispose();
+        }
+
+        return read;
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         _onDisposed(this);
     }
 }
