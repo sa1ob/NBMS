@@ -23,4 +23,24 @@
   <ItemGroup>
     <ProjectReference Include="..\NBMS.Core\NBMS.Core.csproj" />
   </ItemGroup>
+
+  <Target Name="BuildMonoGameViewerForStudioOutput" AfterTargets="Build" Condition="'$(BuildMonoGameViewerForStudio)' != 'false'">
+    <MSBuild Projects="..\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameViewer.csproj"
+             Targets="Build"
+             RemoveProperties="OutputPath;OutDir;PublishDir"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64" />
+    <ItemGroup>
+      <MonoGameViewerOutputFiles Include="..\NBMS.Studio.MonoGameViewer\bin\$(Configuration)\net8.0-windows\win-x64\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MonoGameViewerOutputFiles)"
+          DestinationFiles="@(MonoGameViewerOutputFiles->'$(OutputPath)\Viewers\MonoGame\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="PublishMonoGameViewerForStudioOutput" AfterTargets="Publish" Condition="'$(RuntimeIdentifier)' != '' and '$(BuildMonoGameViewerForStudio)' != 'false'">
+    <MSBuild Projects="..\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameViewer.csproj"
+             Targets="Publish"
+             RemoveProperties="OutputPath;OutDir"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=$(RuntimeIdentifier);SelfContained=$(SelfContained);PublishSingleFile=$(PublishSingleFile);PublishDir=$(PublishDir)Viewers\MonoGame\" />
+  </Target>
 </Project>

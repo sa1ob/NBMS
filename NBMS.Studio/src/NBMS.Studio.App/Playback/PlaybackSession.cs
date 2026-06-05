@@ -6,6 +6,7 @@ namespace NBMS.Studio.App.Playback;
 public sealed class PlaybackSession
 {
     private const double UnknownAudioTailSeconds = 120.0;
+    private const double MaxShortPcmSeconds = 30.0;
 
     private PlaybackSession(
         PlaybackTimelineMap timelineMap,
@@ -71,7 +72,8 @@ public sealed class PlaybackSession
             .ThenBy(item => item.Sequence)
             .ToList();
 
-        var timelineMap = new PlaybackTimelineMap(timelinePoints, ResolveInitialTicksPerSecond(chart));
+        var maxTimelineTick = timelinePoints.Count == 0 ? 0 : timelinePoints.Max(point => point.Tick);
+        var timelineMap = new PlaybackTimelineMap(timelinePoints, timelineService.ResolveTicksPerSecondAt(chart, maxTimelineTick));
         var lastTimelineSeconds = timelineMap.Points.Count == 0 ? 0 : timelineMap.Points.Max(item => item.TimeSeconds);
         var lastAudioSeconds = events.Count == 0
             ? 0
@@ -150,9 +152,7 @@ public sealed class PlaybackSession
         foreach (var entry in entries.Where(entry => usedAudioIds.Contains(entry.AudioId)))
         {
             var durationSeconds = ResolveDurationSeconds(entry, durationOverrides);
-            var mode = ShouldPreload(entry.Codec, durationSeconds, playableAudioIds.Contains(entry.AudioId))
-                ? PlaybackAssetLoadMode.Preload
-                : PlaybackAssetLoadMode.Stream;
+            var mode = ResolveAssetLoadMode(durationSeconds, playableAudioIds.Contains(entry.AudioId));
 
             result.Add(new PlaybackAssetPlan(
                 entry.AudioId,
@@ -168,26 +168,26 @@ public sealed class PlaybackSession
             .ToList();
     }
 
-    private static bool ShouldPreload(string codec, double durationSeconds, bool isPlayableAudio)
+    public PlaybackAssetLoadMode ResolveAssetLoadMode(string audioId)
     {
-        if (durationSeconds > 0 && durationSeconds <= 8.0)
-        {
-            return true;
-        }
-
-        if (!isPlayableAudio)
-        {
-            return false;
-        }
-
-        return IsOggVorbis(codec) && durationSeconds <= 0;
+        return AssetPlan
+            .FirstOrDefault(asset => asset.AudioId.Equals(audioId, StringComparison.Ordinal))
+            ?.Mode ?? PlaybackAssetLoadMode.ShortPcm;
     }
 
-    private static bool IsOggVorbis(string codec)
+    private static PlaybackAssetLoadMode ResolveAssetLoadMode(double durationSeconds, bool isPlayableAudio)
     {
-        return codec.Equals("ogg", StringComparison.OrdinalIgnoreCase) ||
-               codec.Equals("vorbis", StringComparison.OrdinalIgnoreCase) ||
-               codec.Equals("ogg-vorbis", StringComparison.OrdinalIgnoreCase);
+        if (!isPlayableAudio)
+        {
+            return PlaybackAssetLoadMode.LongStream;
+        }
+
+        if (durationSeconds <= 0 || durationSeconds <= MaxShortPcmSeconds)
+        {
+            return PlaybackAssetLoadMode.ShortPcm;
+        }
+
+        return PlaybackAssetLoadMode.LongStream;
     }
 
     private static double ResolveDurationSeconds(
@@ -216,22 +216,6 @@ public sealed class PlaybackSession
             : UnknownAudioTailSeconds;
     }
 
-    private static double ResolveInitialTicksPerSecond(NbmsChart chart)
-    {
-        var bpm = chart.Timing
-            .Where(timing => timing.Type == "bpm" && timing.Value is not null)
-            .OrderBy(timing => timing.Tick)
-            .Select(timing => timing.Value!.Value)
-            .FirstOrDefault();
-
-        if (bpm <= 0)
-        {
-            bpm = 120;
-        }
-
-        return chart.Resolution * bpm / 60.0;
-    }
-
     private static string ResolveAudioId(TimelineItem item)
     {
         if (item.Kind == "BGM")
@@ -253,6 +237,6 @@ public sealed record PlaybackAssetPlan(
 
 public enum PlaybackAssetLoadMode
 {
-    Preload,
-    Stream
+    ShortPcm,
+    LongStream
 }

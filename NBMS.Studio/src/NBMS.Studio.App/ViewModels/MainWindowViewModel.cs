@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Text.Json;
 using Avalonia.Threading;
 using NBMS.Core.Models;
 using NBMS.Core.Services;
@@ -22,12 +23,16 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly NbmsAudioPlayer _audioPlayer = new();
     private readonly PlaybackLookaheadScheduler _playbackScheduler = new();
     private readonly Queue<string> _playbackLogLines = [];
+    private readonly HashSet<string> _urgentAudioPrepareIds = new(StringComparer.Ordinal);
+    private readonly object _monoGameViewerLock = new();
 
     private NbmsProject? _project;
     private LoadedChart? _selectedChart;
     private NbmsAudioCache? _audioCache;
     private Task<NbmsAudioCache?>? _audioCacheTask;
+    private CancellationTokenSource? _audioCachePreparationCts;
     private PlaybackSession? _playbackSession;
+    private Process? _monoGameViewerProcess;
     private List<PlaybackEvent> _playbackEvents = [];
     private List<TimelineRow> _playbackTimeline = [];
     private HashSet<(int Tick, long TimeKey)> _playbackStopPoints = [];
@@ -36,7 +41,10 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private double _playbackOffsetSeconds;
     private double _lastPlaybackPositionTextSeconds = -1;
     private const double UnknownAudioTailSeconds = 120.0;
-    private const double PlaybackLookaheadSeconds = 0.0;
+    private const double PlaybackLookaheadSeconds = 0.25;
+    private const double InitialAudioPrepareSeconds = 6.0;
+    private const double UrgentAudioPrepareSeconds = 4.0;
+    private const int InitialAudioFallbackCount = 24;
     private string _statusText = "NBMS Studio を起動しました。";
     private string _titleText = "";
     private string _artistText = "";
@@ -58,7 +66,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private string _playbackPositionText = "00:00.000";
     private string _playbackDebugText = "session: none";
     private string _playbackLogText = "";
-    private bool _isPlaybackLogVisible = true;
+    private string _audioPreparationText = "";
+    private bool _isPlaybackLogVisible;
 
     public MainWindowViewModel()
     {
@@ -220,6 +229,12 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         set => SetProperty(ref _playbackLogText, value);
     }
 
+    public string AudioPreparationText
+    {
+        get => _audioPreparationText;
+        set => SetProperty(ref _audioPreparationText, value);
+    }
+
     public bool IsPlaybackLogVisible
     {
         get => _isPlaybackLogVisible;
@@ -275,21 +290,307 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         IsPlaybackLogVisible = !IsPlaybackLogVisible;
     }
 
+    public void LaunchMonoGameViewer()
+    {
+        if (_project is null || _selectedChart is null)
+        {
+            StatusText = "MonoGame Viewerを起動するNBMSを開いてください。";
+            return;
+        }
+
+        var executablePath = FindMonoGameViewerExecutablePath();
+        var startInfo = executablePath is not null
+            ? new ProcessStartInfo(executablePath)
+            : null;
+
+        if (startInfo is null)
+        {
+            StatusText = "MonoGame Viewerの実行ファイルまたはプロジェクトが見つかりません。";
+            return;
+        }
+
+        lock (_monoGameViewerLock)
+        {
+            CleanupMonoGameViewerProcess();
+            if (_monoGameViewerProcess is not null)
+            {
+                StatusText = "MonoGame Viewerはすでに起動中です。";
+                return;
+            }
+        }
+
+        startInfo.UseShellExecute = true;
+        startInfo.WindowStyle = ProcessWindowStyle.Normal;
+        startInfo.WorkingDirectory = Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory;
+        startInfo.Arguments = $"{QuoteProcessArgument(_project.HeaderPath)} --chart {QuoteProcessArgument(_selectedChart.Reference.Id)}";
+
+        var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            StatusText = "MonoGame Viewerを起動できませんでした。";
+            return;
+        }
+
+        process.EnableRaisingEvents = true;
+        process.Exited += (_, _) =>
+        {
+            lock (_monoGameViewerLock)
+            {
+                if (ReferenceEquals(_monoGameViewerProcess, process))
+                {
+                    _monoGameViewerProcess = null;
+                }
+            }
+        };
+
+        lock (_monoGameViewerLock)
+        {
+            _monoGameViewerProcess = process;
+        }
+
+        _ = MonitorMonoGameViewerStartupAsync(process);
+        StatusText = "MonoGame Viewerを起動しました。";
+    }
+
+    public void SetMonoGameViewerPath(string executablePath)
+    {
+        if (!File.Exists(executablePath))
+        {
+            StatusText = "指定されたMonoGame Viewerが見つかりません。";
+            return;
+        }
+
+        var fileName = Path.GetFileName(executablePath);
+        if (!fileName.Equals("NBMS.Studio.MonoGameViewer.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            StatusText = "NBMS.Studio.MonoGameViewer.exeを指定してください。";
+            return;
+        }
+
+        SaveStudioSettings(new StudioSettings
+        {
+            MonoGameViewerPath = executablePath
+        });
+        StatusText = $"MonoGame Viewerのパスを保存しました: {executablePath}";
+    }
+
+    private async Task MonitorMonoGameViewerStartupAsync(Process process)
+    {
+        try
+        {
+            try
+            {
+                process.WaitForInputIdle(3000);
+            }
+            catch
+            {
+                // MonoGameの初期化状態によってはInputIdleを待てないため、通常のpollに戻す。
+            }
+
+            for (var attempt = 0; attempt < 100; attempt++)
+            {
+                await Task.Delay(200);
+                process.Refresh();
+                if (process.HasExited)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        StatusText = $"MonoGame Viewerが終了しました。ExitCode={process.ExitCode}";
+                    });
+                    return;
+                }
+
+                if (process.MainWindowHandle != IntPtr.Zero)
+                {
+                    return;
+                }
+            }
+
+            process.Refresh();
+            if (!process.HasExited && process.MainWindowHandle == IntPtr.Zero)
+            {
+                process.Kill(entireProcessTree: true);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    StatusText = "MonoGame Viewerのウィンドウが表示されなかったため、プロセスを停止しました。%TEMP%\\NBMS.Studio.MonoGameViewer.logを確認してください。";
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                StatusText = $"MonoGame Viewer起動監視で例外が発生しました: {ex.Message}";
+            });
+        }
+        finally
+        {
+            lock (_monoGameViewerLock)
+            {
+                CleanupMonoGameViewerProcess();
+            }
+        }
+    }
+
+    private void CleanupMonoGameViewerProcess()
+    {
+        if (_monoGameViewerProcess is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _monoGameViewerProcess.Refresh();
+            if (!_monoGameViewerProcess.HasExited && _monoGameViewerProcess.MainWindowHandle == IntPtr.Zero)
+            {
+                _monoGameViewerProcess.Kill(entireProcessTree: true);
+                _monoGameViewerProcess.WaitForExit(1000);
+            }
+        }
+        catch
+        {
+        }
+
+        if (_monoGameViewerProcess.HasExited)
+        {
+            _monoGameViewerProcess.Dispose();
+            _monoGameViewerProcess = null;
+        }
+    }
+
+    private void StopMonoGameViewer()
+    {
+        Process? process;
+        lock (_monoGameViewerLock)
+        {
+            process = _monoGameViewerProcess;
+            _monoGameViewerProcess = null;
+        }
+
+        if (process is null)
+        {
+            return;
+        }
+
+        try
+        {
+            process.Refresh();
+            if (!process.HasExited)
+            {
+                if (process.MainWindowHandle != IntPtr.Zero)
+                {
+                    process.CloseMainWindow();
+                    if (!process.WaitForExit(1500))
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                }
+                else
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
     public async Task OpenProjectAsync(string headerPath)
     {
         StopPlayback();
+        CancelAudioCachePreparation();
         _audioCache?.Dispose();
         _audioCache = null;
         _audioCacheTask = null;
+        _urgentAudioPrepareIds.Clear();
 
         _project = await _projectService.OpenHeaderAsync(headerPath);
         _selectedChart = _project.Charts.FirstOrDefault();
-        StartAudioCacheWarmup(_project);
+        AudioPreparationText = "";
 
         LoadHeaderFields();
         RefreshCollections();
         StatusText = $"読み込み完了: {headerPath}";
         OnPropertyChanged(nameof(HasProject));
+    }
+
+    private static string? FindMonoGameViewerExecutablePath()
+    {
+        var relativeExecutable = Path.Combine(
+            AppContext.BaseDirectory,
+            "Viewers",
+            "MonoGame",
+            "NBMS.Studio.MonoGameViewer.exe");
+        if (File.Exists(relativeExecutable))
+        {
+            return relativeExecutable;
+        }
+
+        var settings = LoadStudioSettings();
+        if (!string.IsNullOrWhiteSpace(settings.MonoGameViewerPath) &&
+            File.Exists(settings.MonoGameViewerPath))
+        {
+            return settings.MonoGameViewerPath;
+        }
+
+        return null;
+    }
+
+    private static StudioSettings LoadStudioSettings()
+    {
+        var path = ResolveStudioSettingsPath();
+        if (!File.Exists(path))
+        {
+            return new StudioSettings();
+        }
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<StudioSettings>(json) ?? new StudioSettings();
+        }
+        catch
+        {
+            return new StudioSettings();
+        }
+    }
+
+    private static void SaveStudioSettings(StudioSettings settings)
+    {
+        var path = ResolveStudioSettingsPath();
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions
+        {
+            WriteIndented = true
+        });
+        File.WriteAllText(path, json);
+    }
+
+    private static string ResolveStudioSettingsPath()
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return Path.Combine(appData, "NBMS Studio", "settings.json");
+    }
+
+    private static string QuoteProcessArgument(string value)
+    {
+        return $"\"{value.Replace("\"", "\\\"")}\"";
+    }
+
+    private sealed class StudioSettings
+    {
+        public string? MonoGameViewerPath { get; set; }
     }
 
     public async Task SaveProjectAsync()
@@ -356,8 +657,14 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
 
         StopPlayback();
+        CancelAudioCachePreparation();
         ApplyNoteRows();
         _selectedChart = _project.Charts.FirstOrDefault(chart => chart.Reference.Id == chartId) ?? _project.Charts.FirstOrDefault();
+        _audioCache?.Dispose();
+        _audioCache = null;
+        _audioCacheTask = null;
+        _urgentAudioPrepareIds.Clear();
+        AudioPreparationText = "";
         _selectedChartRow = Charts.FirstOrDefault(row => row.Id == _selectedChart?.Reference.Id);
         OnPropertyChanged(nameof(SelectedChartRow));
         RefreshNotesAndTimeline();
@@ -460,20 +767,6 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (_audioCache is null)
-        {
-            AppendPlaybackLog("PLAY", "wait audio cache");
-            StatusText = "音源キャッシュを準備しています...";
-            await EnsureAudioCacheAsync();
-        }
-
-        if (_audioCache is null)
-        {
-            StatusText = "音源パックを準備できませんでした。";
-            AppendPlaybackLog("PLAY", "start failed: audio cache is null");
-            return;
-        }
-
         ApplyNoteRows();
         BuildPlaybackSchedule();
         AppendPlaybackLog(
@@ -487,8 +780,32 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var allAudioIds = ResolveRequiredAudioIds(_playbackSession);
+        var initialAudioIds = ResolveInitialAudioIds(_playbackSession, _playbackOffsetSeconds);
+        var startupAudioIds = ResolveStartupAudioIds(_playbackSession, initialAudioIds);
+        if (_audioCache is null || !_audioCache.Covers(startupAudioIds))
+        {
+            AppendPlaybackLog("PLAY", $"wait startup audio cache required={startupAudioIds.Count}/{allAudioIds.Count}");
+            StatusText = "object音源のPCMキャッシュを準備しています...";
+            AudioPreparationText = $"Audio preparing... 0/{startupAudioIds.Count}";
+            await EnsureAudioCacheAsync(startupAudioIds, "startup");
+        }
+
+        if (_audioCache is null)
+        {
+            StatusText = "音源パックを準備できませんでした。";
+            AudioPreparationText = "";
+            AppendPlaybackLog("PLAY", "start failed: audio cache is null");
+            return;
+        }
+
+        // duration未設定音源は展開後に読めるため、キャッシュ準備後に再度スケジュールを作り直す。
+        BuildPlaybackSchedule();
+        AudioPreparationText = "";
         _audioPlayer.StopAll();
         _audioPlayer.ClearPreloaded();
+        PreloadPlaybackAssets(startupAudioIds);
+
         _playbackScheduler.Reset(_playbackSession, _playbackOffsetSeconds);
         _nextPlaybackEventIndex = _playbackScheduler.NextEventIndex;
 
@@ -498,8 +815,10 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         IsPlaying = true;
         StatusText = "再生中です。";
         AppendPlaybackLog("PLAY", $"start next={_nextPlaybackEventIndex} tick={PlayheadTick:0.##}");
+        _audioPlayer.StartPlaybackClock(_playbackOffsetSeconds);
         _playbackClock.Restart();
         _playbackTimer.Start();
+        StartBackgroundAudioCachePreparation(allAudioIds, startupAudioIds);
     }
 
     public void StartPlayback()
@@ -517,10 +836,11 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         _playbackTimer.Stop();
         if (_playbackClock.IsRunning)
         {
-            _playbackOffsetSeconds += _playbackClock.Elapsed.TotalSeconds;
+            _playbackOffsetSeconds = ResolvePlaybackElapsedSeconds();
         }
 
         _playbackClock.Reset();
+        _audioPlayer.StopPlaybackClock(_playbackOffsetSeconds);
         _audioPlayer.StopAll();
         IsPlaying = false;
         PlaybackPositionText = TimeSpan.FromSeconds(_playbackOffsetSeconds).ToString(@"mm\:ss\.fff");
@@ -542,6 +862,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     {
         _playbackTimer.Stop();
         _playbackClock.Reset();
+        _audioPlayer.StopPlaybackClock(0);
         _audioPlayer.StopAll();
         _nextPlaybackEventIndex = 0;
         _playbackScheduler.Clear();
@@ -569,37 +890,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         LicenseText = _project.Header.Rights.License;
     }
 
-    private void StartAudioCacheWarmup(NbmsProject project)
+    private async Task EnsureAudioCacheAsync(IReadOnlyCollection<string> requiredAudioIds, string label)
     {
-        _audioCacheTask = CreateAudioCacheAsync(project);
-        _ = CompleteAudioCacheWarmupAsync(project, _audioCacheTask);
-    }
-
-    private async Task CompleteAudioCacheWarmupAsync(NbmsProject project, Task<NbmsAudioCache?> task)
-    {
-        try
-        {
-            var cache = await task;
-            if (ReferenceEquals(_project, project) && _audioCache is null)
-            {
-                _audioCache = cache;
-                return;
-            }
-
-            if (!ReferenceEquals(_audioCache, cache))
-            {
-                cache?.Dispose();
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendPlaybackLog("AUDIO", $"cache warmup failed: {ex.Message}");
-        }
-    }
-
-    private async Task EnsureAudioCacheAsync()
-    {
-        if (_audioCache is not null)
+        if (_audioCache is not null && _audioCache.Covers(requiredAudioIds))
         {
             return;
         }
@@ -609,30 +902,115 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _audioCacheTask ??= CreateAudioCacheAsync(_project);
-        var cache = await _audioCacheTask;
-        if (_audioCache is null)
+        _audioCache ??= CreateAudioCache(_project);
+        var cache = _audioCache;
+        var progress = CreateAudioCacheProgress(label);
+        var token = ResetAudioCachePreparationToken();
+        _audioCacheTask = Task.Run<NbmsAudioCache?>(() =>
         {
-            _audioCache = cache;
-        }
-        else if (!ReferenceEquals(_audioCache, cache))
-        {
-            cache?.Dispose();
-        }
+            cache.PrepareAudioIds(requiredAudioIds, progress, token);
+            return cache;
+        }, token);
+
+        await _audioCacheTask;
     }
 
-    private static Task<NbmsAudioCache?> CreateAudioCacheAsync(NbmsProject project)
+    private void StartBackgroundAudioCachePreparation(
+        IReadOnlyCollection<string> allAudioIds,
+        IReadOnlyCollection<string> initialAudioIds)
+    {
+        if (_project is null || _audioCache is null)
+        {
+            return;
+        }
+
+        var remainingAudioIds = allAudioIds
+            .Except(initialAudioIds, StringComparer.Ordinal)
+            .Where(audioId => !_audioCache.Covers([audioId]))
+            .ToArray();
+        if (remainingAudioIds.Length == 0)
+        {
+            return;
+        }
+
+        var cache = _audioCache;
+        var progress = CreateAudioCacheProgress("background");
+        var token = _audioCachePreparationCts?.Token ?? CancellationToken.None;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                foreach (var audioId in remainingAudioIds)
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (cache.Covers([audioId]))
+                    {
+                        continue;
+                    }
+
+                    cache.PrepareAudioIds([audioId], progress, token);
+                    PreloadPlaybackAssets([audioId]);
+                    Thread.Yield();
+                }
+
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (ReferenceEquals(_audioCache, cache))
+                    {
+                        AudioPreparationText = "";
+                        AppendPlaybackLog("AUDIO", $"background cache ready {remainingAudioIds.Length}");
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() => AppendPlaybackLog("AUDIO", $"background cache failed: {ex.Message}"));
+            }
+        }, token);
+    }
+
+    private IProgress<AudioCacheProgress> CreateAudioCacheProgress(string label)
+    {
+        return new Progress<AudioCacheProgress>(progress =>
+        {
+            AudioPreparationText = $"Audio preparing {label}... {progress.Processed}/{progress.Total} {progress.Stage} {progress.AudioId}";
+        });
+    }
+
+    private static NbmsAudioCache CreateAudioCache(NbmsProject project)
     {
         if (project.AudioManifest is null)
         {
-            return Task.FromResult<NbmsAudioCache?>(null);
+            throw new InvalidDataException("音源manifestがありません。");
         }
 
         var audioPath = Path.GetFullPath(Path.Combine(
             project.RootDirectory,
             project.Header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
 
-        return Task.Run<NbmsAudioCache?>(() => NbmsAudioCache.Create(audioPath, project.AudioManifest));
+        return NbmsAudioCache.CreateEmpty(audioPath, project.AudioManifest);
+    }
+
+    private CancellationToken ResetAudioCachePreparationToken()
+    {
+        CancelAudioCachePreparation();
+        _audioCachePreparationCts = new CancellationTokenSource();
+        return _audioCachePreparationCts.Token;
+    }
+
+    private void CancelAudioCachePreparation()
+    {
+        if (_audioCachePreparationCts is null)
+        {
+            return;
+        }
+
+        _audioCachePreparationCts.Cancel();
+        _audioCachePreparationCts.Dispose();
+        _audioCachePreparationCts = null;
     }
 
     private void ApplyHeaderFields()
@@ -783,6 +1161,71 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         UpdatePlaybackDebugText(_playbackOffsetSeconds);
     }
 
+    private static IReadOnlyCollection<string> ResolveRequiredAudioIds(PlaybackSession session)
+    {
+        return session.Events
+            .Select(playbackEvent => playbackEvent.AudioId)
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static IReadOnlyCollection<string> ResolveInitialAudioIds(PlaybackSession session, double startSeconds)
+    {
+        var initialEndSeconds = startSeconds + InitialAudioPrepareSeconds;
+        var initialAudioIds = session.Events
+            .Where(playbackEvent => playbackEvent.TimeSeconds >= startSeconds &&
+                                    playbackEvent.TimeSeconds <= initialEndSeconds)
+            .Select(playbackEvent => playbackEvent.AudioId)
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (initialAudioIds.Length > 0)
+        {
+            return initialAudioIds;
+        }
+
+        // 曲頭に長い無音がある譜面でも、最初の発音でReader生成が集中しないよう少数だけ先に準備する。
+        return session.Events
+            .Where(playbackEvent => playbackEvent.TimeSeconds >= startSeconds)
+            .Select(playbackEvent => playbackEvent.AudioId)
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .Distinct(StringComparer.Ordinal)
+            .Take(InitialAudioFallbackCount)
+            .ToArray();
+    }
+
+    private static IReadOnlyCollection<string> ResolveStartupAudioIds(
+        PlaybackSession session,
+        IReadOnlyCollection<string> initialAudioIds)
+    {
+        var shortPcmAssets = session.AssetPlan
+            .Where(asset => asset.Mode == PlaybackAssetLoadMode.ShortPcm)
+            .ToList();
+        var hasOggShortPcm = shortPcmAssets.Any(asset => IsOggVorbisAsset(asset));
+        if (!hasOggShortPcm)
+        {
+            return initialAudioIds;
+        }
+
+        // OGG短音は発音時streamや直前decodeだと欠落しやすいため、object音を再生開始前にPCM化する。
+        return initialAudioIds
+            .Concat(shortPcmAssets.Select(asset => asset.AudioId))
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static bool IsOggVorbisAsset(PlaybackAssetPlan asset)
+    {
+        return asset.Codec.Equals("ogg", StringComparison.OrdinalIgnoreCase) ||
+               asset.Codec.Equals("vorbis", StringComparison.OrdinalIgnoreCase) ||
+               asset.Codec.Equals("ogg-vorbis", StringComparison.OrdinalIgnoreCase) ||
+               Path.GetExtension(asset.Path).Equals(".ogg", StringComparison.OrdinalIgnoreCase) ||
+               Path.GetExtension(asset.Path).Equals(".oga", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static double ResolvePlaybackTailSeconds(PlaybackEvent playbackEvent)
     {
         return playbackEvent.DurationSeconds > 0
@@ -811,6 +1254,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         {
             _playbackTimer.Stop();
             _playbackClock.Reset();
+            _audioPlayer.StopPlaybackClock(_playbackOffsetSeconds);
             IsPlaying = false;
             StatusText = $"再生タイマーで例外が発生しました: {ex.Message}";
             AppendPlaybackLog("ERROR", $"{ex.GetType().Name}: {ex.Message}");
@@ -820,7 +1264,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     private void UpdatePlayback()
     {
-        var elapsedSeconds = _playbackOffsetSeconds + _playbackClock.Elapsed.TotalSeconds;
+        var elapsedSeconds = ResolvePlaybackElapsedSeconds();
         if (_lastPlaybackPositionTextSeconds < 0 || elapsedSeconds - _lastPlaybackPositionTextSeconds >= 0.05)
         {
             PlaybackPositionText = TimeSpan.FromSeconds(elapsedSeconds).ToString(@"mm\:ss\.fff");
@@ -831,6 +1275,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         if (_playbackSession is not null)
         {
+            QueueUrgentAudioPreparation(elapsedSeconds);
+
             foreach (var playbackEvent in _playbackScheduler.Poll(elapsedSeconds, PlaybackLookaheadSeconds))
             {
                 PlayPlaybackEvent(playbackEvent, elapsedSeconds);
@@ -852,10 +1298,56 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
     }
 
+    private void QueueUrgentAudioPreparation(double elapsedSeconds)
+    {
+        if (_playbackSession is null || _audioCache is null)
+        {
+            return;
+        }
+
+        var urgentEndSeconds = elapsedSeconds + UrgentAudioPrepareSeconds;
+        var missingAudioIds = _playbackSession.Events
+            .Where(playbackEvent => playbackEvent.TimeSeconds >= elapsedSeconds &&
+                                    playbackEvent.TimeSeconds <= urgentEndSeconds)
+            .Select(playbackEvent => playbackEvent.AudioId)
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .Distinct(StringComparer.Ordinal)
+            .Where(audioId => !_audioCache.Covers([audioId]))
+            .Where(audioId => _urgentAudioPrepareIds.Add(audioId))
+            .ToArray();
+
+        if (missingAudioIds.Length == 0)
+        {
+            return;
+        }
+
+        var cache = _audioCache;
+        var progress = CreateAudioCacheProgress("urgent");
+        var token = _audioCachePreparationCts?.Token ?? CancellationToken.None;
+        AppendPlaybackLog("AUDIO", $"urgent cache queue {missingAudioIds.Length}");
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                cache.PrepareAudioIds(missingAudioIds, progress, token);
+                PreloadPlaybackAssets(missingAudioIds);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Dispatcher.UIThread.Post(() => AppendPlaybackLog("AUDIO", $"urgent cache failed: {ex.Message}"));
+            }
+        }, token);
+    }
+
     private void FinishPlaybackTimelineOnly()
     {
         _playbackTimer.Stop();
         _playbackClock.Reset();
+        _audioPlayer.StopPlaybackClock(0);
         _playbackOffsetSeconds = 0;
         IsPlaying = false;
         _nextPlaybackEventIndex = 0;
@@ -878,8 +1370,27 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         if (!_audioCache.TryGetFilePath(playbackEvent.AudioId, out var filePath))
         {
-            AppendPlaybackLog("AUDIO", $"missing {playbackEvent.AudioId}");
-            return;
+            AppendPlaybackLog("AUDIO", $"last-chance prepare {playbackEvent.AudioId}");
+            try
+            {
+                _audioCache.PrepareAudioIds([playbackEvent.AudioId], CreateAudioCacheProgress("last"), _audioCachePreparationCts?.Token ?? CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                AppendPlaybackLog("AUDIO", $"last-chance failed {playbackEvent.AudioId}: {ex.Message}");
+            }
+
+            if (!_audioCache.TryGetFilePath(playbackEvent.AudioId, out filePath))
+            {
+                AppendPlaybackLog("AUDIO", $"missing {playbackEvent.AudioId}");
+                return;
+            }
+        }
+
+        if ((_playbackSession?.ResolveAssetLoadMode(playbackEvent.AudioId) ?? PlaybackAssetLoadMode.ShortPcm) == PlaybackAssetLoadMode.ShortPcm &&
+            !_audioPlayer.IsPreloaded(playbackEvent.AudioId))
+        {
+            PreloadPlaybackAssets([playbackEvent.AudioId]);
         }
  
         try
@@ -889,11 +1400,19 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
                 $"{playbackEvent.TimeSeconds:0.000}s tick={playbackEvent.Tick} delay={Math.Max(0, playbackEvent.TimeSeconds - elapsedSeconds):0.000}s {playbackEvent.Kind}/{playbackEvent.Lane} {playbackEvent.AudioId}");
             if (_audioPlayer.PlayPreloadedOneShot(playbackEvent.AudioId, playbackEvent.TimeSeconds - elapsedSeconds))
             {
-                AppendPlaybackLog("EVENT", $"route=preloaded {playbackEvent.AudioId}");
+                AppendPlaybackLog("EVENT", $"route=short-pcm {playbackEvent.AudioId}");
             }
             else
             {
-                AppendPlaybackLog("EVENT", $"route=stream {playbackEvent.AudioId} file={Path.GetFileName(filePath)}");
+                var mode = _playbackSession?.ResolveAssetLoadMode(playbackEvent.AudioId) ?? PlaybackAssetLoadMode.ShortPcm;
+                if (mode == PlaybackAssetLoadMode.ShortPcm)
+                {
+                    AppendPlaybackLog("AUDIO", $"short-pcm not ready; route=emergency-stream {playbackEvent.AudioId} file={Path.GetFileName(filePath)}");
+                    _audioPlayer.PlayOneShot(filePath, playbackEvent.TimeSeconds - elapsedSeconds);
+                    return;
+                }
+
+                AppendPlaybackLog("EVENT", $"route=long-stream {playbackEvent.AudioId} file={Path.GetFileName(filePath)}");
                 _audioPlayer.PlayOneShot(filePath, playbackEvent.TimeSeconds - elapsedSeconds);
             }
         }
@@ -909,16 +1428,31 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         return _playbackSession?.EstimateTickAt(elapsedSeconds) ?? 0;
     }
 
-    private void PreloadPlaybackAssets()
+    private double ResolvePlaybackElapsedSeconds()
+    {
+        return IsPlaying
+            ? _audioPlayer.GetPlaybackClockSeconds()
+            : _playbackOffsetSeconds;
+    }
+
+    private void PreloadPlaybackAssets(IEnumerable<string>? audioIds = null)
     {
         if (_playbackSession is null || _audioCache is null)
         {
             return;
         }
 
+        var filter = audioIds?
+            .Where(audioId => !string.IsNullOrWhiteSpace(audioId))
+            .ToHashSet(StringComparer.Ordinal);
         var requests = new List<PlaybackPreloadRequest>();
-        foreach (var asset in _playbackSession.AssetPlan.Where(asset => asset.Mode == PlaybackAssetLoadMode.Preload))
+        foreach (var asset in _playbackSession.AssetPlan.Where(asset => asset.Mode == PlaybackAssetLoadMode.ShortPcm))
         {
+            if (filter is not null && !filter.Contains(asset.AudioId))
+            {
+                continue;
+            }
+
             if (_audioCache.TryGetFilePath(asset.AudioId, out var filePath))
             {
                 requests.Add(new PlaybackPreloadRequest(asset.AudioId, filePath));
@@ -930,7 +1464,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
-        AppendPlaybackLog("PLAY", $"preload assets={requests.Count}");
+        Dispatcher.UIThread.Post(() => AppendPlaybackLog("PLAY", $"preload assets={requests.Count}"));
         _audioPlayer.Preload(requests);
     }
 
@@ -1018,6 +1552,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         StopPlayback();
+        StopMonoGameViewer();
         _audioPlayer.Dispose();
         _audioCache?.Dispose();
     }

@@ -110,6 +110,33 @@ public sealed partial class MainWindow : Window
         ShowPlaybackWindow();
     }
 
+    private void MonoGameViewer_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.LaunchMonoGameViewer();
+    }
+
+    private async void SetMonoGameViewerPath_Click(object? sender, RoutedEventArgs e)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        {
+            Title = "Select MonoGame Viewer",
+            AllowMultiple = false,
+            FileTypeFilter =
+            [
+                new Avalonia.Platform.Storage.FilePickerFileType("MonoGame Viewer")
+                {
+                    Patterns = ["NBMS.Studio.MonoGameViewer.exe", "*.exe"]
+                }
+            ]
+        });
+
+        var file = files.FirstOrDefault();
+        if (file?.Path.LocalPath is { Length: > 0 } path)
+        {
+            _viewModel.SetMonoGameViewerPath(path);
+        }
+    }
+
     private void Stop_Click(object? sender, RoutedEventArgs e)
     {
         ShowPlaybackWindow();

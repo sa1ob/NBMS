@@ -57,6 +57,22 @@ public sealed class TimelineService
         return items.OrderBy(item => item.TimeSeconds).ThenBy(item => item.Tick).ToList();
     }
 
+    public Dictionary<int, double> BuildTickTimeMap(NbmsChart chart, IEnumerable<int> ticks)
+    {
+        var segments = BuildBpmSegments(chart);
+        var stopDurations = BuildStopDurations(chart, segments);
+        return ticks
+            .Distinct()
+            .ToDictionary(tick => tick, tick => TickToSeconds(tick, segments, stopDurations));
+    }
+
+    public double ResolveTicksPerSecondAt(NbmsChart chart, int tick)
+    {
+        var segments = BuildBpmSegments(chart);
+        var segment = FindSegment(tick, segments);
+        return segment.SecondsPerTick > 0 ? 1.0 / segment.SecondsPerTick : chart.Resolution * 120 / 60.0;
+    }
+
     private static List<BpmSegment> BuildBpmSegments(NbmsChart chart)
     {
         var bpmEvents = chart.Timing

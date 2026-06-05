@@ -7,11 +7,13 @@ namespace NBMS.Studio.App.Playback;
 
 public sealed class NbmsAudioPlayer : IDisposable
 {
-    private const float OneShotVolume = 0.30f;
-    private const int MaxPreloadSeconds = 12;
+    private const float OneShotVolume = 0.22f;
+    private const double OneShotFadeInMilliseconds = 3.0;
+    private const int MaxPreloadSeconds = 30;
 
     private readonly WaveOutEvent _output;
     private readonly MixingSampleProvider _mixer;
+    private readonly SampleCountingProvider _sampleCounter;
     private readonly WaveFormat _mixFormat = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
     private readonly List<IDisposable> _activeSources = [];
     private readonly Queue<PlaybackRequest> _pendingRequests = [];
@@ -21,6 +23,9 @@ public sealed class NbmsAudioPlayer : IDisposable
     private readonly Task _workerTask;
     private bool _disposed;
     private int _generation;
+    private long _clockStartSampleFrame;
+    private double _clockStartSeconds;
+    private int _isPlaybackClockRunning;
 
     public event Action<string>? LogMessage;
 
@@ -35,9 +40,35 @@ public sealed class NbmsAudioPlayer : IDisposable
         {
             DesiredLatency = 80
         };
-        _output.Init(new SoftClipSampleProvider(_mixer).ToWaveProvider());
+        _sampleCounter = new SampleCountingProvider(new SimpleLimiterSampleProvider(_mixer));
+        _output.Init(_sampleCounter.ToWaveProvider());
         _output.Play();
         _workerTask = Task.Run(ProcessPlaybackRequestsAsync);
+    }
+
+    public void StartPlaybackClock(double startSeconds)
+    {
+        Volatile.Write(ref _clockStartSampleFrame, _sampleCounter.TotalSampleFramesRead);
+        _clockStartSeconds = startSeconds;
+        Volatile.Write(ref _isPlaybackClockRunning, 1);
+    }
+
+    public double GetPlaybackClockSeconds()
+    {
+        if (Volatile.Read(ref _isPlaybackClockRunning) == 0)
+        {
+            return _clockStartSeconds;
+        }
+
+        var frames = _sampleCounter.TotalSampleFramesRead - Volatile.Read(ref _clockStartSampleFrame);
+        return _clockStartSeconds + Math.Max(0, frames) / (double)_mixFormat.SampleRate;
+    }
+
+    public void StopPlaybackClock(double stopSeconds)
+    {
+        _clockStartSeconds = stopSeconds;
+        Volatile.Write(ref _clockStartSampleFrame, _sampleCounter.TotalSampleFramesRead);
+        Volatile.Write(ref _isPlaybackClockRunning, 0);
     }
 
     public void PlayOneShot(string filePath)
@@ -73,6 +104,14 @@ public sealed class NbmsAudioPlayer : IDisposable
         }
     }
 
+    public bool IsPreloaded(string audioId)
+    {
+        lock (_gate)
+        {
+            return _preloadedClips.ContainsKey(audioId);
+        }
+    }
+
     public bool PlayPreloadedOneShot(string audioId, double delaySeconds)
     {
         PreloadedAudioClip clip;
@@ -85,7 +124,8 @@ public sealed class NbmsAudioPlayer : IDisposable
         }
 
         var source = new PreloadedSampleProvider(clip.Samples, clip.WaveFormat, RemoveDisposedSource);
-        var volume = new VolumeSampleProvider(source)
+        var fadeIn = new FadeInSampleProvider(source, OneShotFadeInMilliseconds);
+        var volume = new VolumeSampleProvider(fadeIn)
         {
             Volume = OneShotVolume
         };
@@ -200,7 +240,8 @@ public sealed class NbmsAudioPlayer : IDisposable
             var sample = NormalizeFormat(reader.ToSampleProvider());
             source = new AutoDisposeSampleProvider(sample, reader, RemoveDisposedSource);
 
-            var volume = new VolumeSampleProvider(source)
+            var fadeIn = new FadeInSampleProvider(source, OneShotFadeInMilliseconds);
+            var volume = new VolumeSampleProvider(fadeIn)
             {
                 Volume = OneShotVolume
             };
@@ -480,11 +521,54 @@ internal sealed class PreloadedSampleProvider : ISampleProvider, IDisposable
     }
 }
 
-internal sealed class SoftClipSampleProvider : ISampleProvider
+internal sealed class FadeInSampleProvider : ISampleProvider
 {
     private readonly ISampleProvider _source;
+    private readonly int _fadeInSamples;
+    private int _position;
 
-    public SoftClipSampleProvider(ISampleProvider source)
+    public FadeInSampleProvider(ISampleProvider source, double fadeInMilliseconds)
+    {
+        _source = source;
+        _fadeInSamples = Math.Max(0, (int)(source.WaveFormat.SampleRate * source.WaveFormat.Channels * fadeInMilliseconds / 1000.0));
+    }
+
+    public WaveFormat WaveFormat => _source.WaveFormat;
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        var read = _source.Read(buffer, offset, count);
+        if (_fadeInSamples <= 0)
+        {
+            _position += read;
+            return read;
+        }
+
+        for (var i = 0; i < read; i++)
+        {
+            var fadePosition = _position + i;
+            if (fadePosition >= _fadeInSamples)
+            {
+                break;
+            }
+
+            buffer[offset + i] *= fadePosition / (float)_fadeInSamples;
+        }
+
+        _position += read;
+        return read;
+    }
+}
+
+internal sealed class SimpleLimiterSampleProvider : ISampleProvider
+{
+    private const float MasterGain = 0.85f;
+    private const float Threshold = 0.92f;
+    private const float Release = 0.0015f;
+    private readonly ISampleProvider _source;
+    private float _gain = 1f;
+
+    public SimpleLimiterSampleProvider(ISampleProvider source)
     {
         _source = source;
     }
@@ -497,11 +581,45 @@ internal sealed class SoftClipSampleProvider : ISampleProvider
         for (var i = 0; i < read; i++)
         {
             var index = offset + i;
-            var value = buffer[index];
-            if (MathF.Abs(value) > 1f)
+            var value = buffer[index] * MasterGain;
+            var absolute = MathF.Abs(value);
+            var targetGain = absolute > Threshold ? Threshold / absolute : 1f;
+            if (targetGain < _gain)
             {
-                buffer[index] = MathF.Sign(value) * (1f - 1f / (MathF.Abs(value) + 1f));
+                _gain = targetGain;
             }
+            else
+            {
+                _gain = Math.Min(1f, _gain + Release);
+            }
+
+            buffer[index] = Math.Clamp(value * _gain, -Threshold, Threshold);
+        }
+
+        return read;
+    }
+}
+
+internal sealed class SampleCountingProvider : ISampleProvider
+{
+    private readonly ISampleProvider _source;
+    private long _totalSamplesRead;
+
+    public SampleCountingProvider(ISampleProvider source)
+    {
+        _source = source;
+    }
+
+    public WaveFormat WaveFormat => _source.WaveFormat;
+
+    public long TotalSampleFramesRead => Interlocked.Read(ref _totalSamplesRead) / WaveFormat.Channels;
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        var read = _source.Read(buffer, offset, count);
+        if (read > 0)
+        {
+            Interlocked.Add(ref _totalSamplesRead, read);
         }
 
         return read;

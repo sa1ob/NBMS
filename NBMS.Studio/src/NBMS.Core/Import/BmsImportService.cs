@@ -208,7 +208,7 @@ public sealed partial class BmsImportService
             Title = doc.Title,
             Artist = doc.Artist,
             Genre = doc.Genre,
-            Bpm = new BpmInfo { Initial = doc.Bpm, Min = ResolveMinBpm(doc), Max = ResolveMaxBpm(doc) },
+            Bpm = ResolveBpmInfo(doc, chart),
             Audio = new FileReference { File = "audio.nbma" },
             Charts =
             [
@@ -457,14 +457,20 @@ public sealed partial class BmsImportService
         return BackgroundLanes[count % BackgroundLanes.Length];
     }
 
-    private static double ResolveMinBpm(BmsImportDocument doc)
+    private static BpmInfo ResolveBpmInfo(BmsImportDocument doc, NbmsChart chart)
     {
-        return new[] { doc.Bpm }.Concat(doc.BpmDefinitions.Values).Where(value => value > 0).DefaultIfEmpty(doc.Bpm).Min();
-    }
+        var bpmValues = chart.Timing
+            .Where(timing => timing.Type == "bpm" && timing.Value is not null && timing.Value.Value > 0)
+            .Select(timing => timing.Value!.Value)
+            .DefaultIfEmpty(doc.Bpm)
+            .ToList();
 
-    private static double ResolveMaxBpm(BmsImportDocument doc)
-    {
-        return new[] { doc.Bpm }.Concat(doc.BpmDefinitions.Values).Where(value => value > 0).DefaultIfEmpty(doc.Bpm).Max();
+        return new BpmInfo
+        {
+            Initial = doc.Bpm,
+            Min = bpmValues.Min(),
+            Max = bpmValues.Max()
+        };
     }
 
     private static int TimingSortOrder(string type)

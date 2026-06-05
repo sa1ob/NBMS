@@ -43,7 +43,9 @@
         <MenuItem Header="拡張モジュール設定（未実装）" IsEnabled="False" />
       </MenuItem>
       <MenuItem Header="外部ビューワ">
-        <MenuItem Header="Viewerを開く" Click="Play_Click" />
+        <MenuItem Header="MonoGame Viewerを開く" Click="MonoGameViewer_Click" />
+        <Separator />
+        <MenuItem Header="MonoGame Viewerのパスを設定..." Click="SetMonoGameViewerPath_Click" />
       </MenuItem>
       <MenuItem Header="ヘルプ">
         <!-- 
@@ -59,7 +61,14 @@
         <Button Grid.Column="1" Content="BMS一括変換" Click="ConvertBms_Click" MinWidth="112" Margin="0,0,8,0" />
         <Button Grid.Column="2" Content="保存" Click="Save_Click" MinWidth="72" Margin="0,0,8,0" />
         <Button Grid.Column="3" Content=".nbmp作成" Click="ExportPackage_Click" MinWidth="104" Margin="0,0,8,0" />
-        <Button Grid.Column="4" Content="Viewer" Click="Play_Click" MinWidth="88" />
+        <Button Grid.Column="4" Content="MonoGame(Viewer)" Click="MonoGameViewer_Click" MinWidth="96">
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem Header="MonoGame Viewerを開く" Click="MonoGameViewer_Click" />
+              <MenuItem Header="MonoGame Viewerのパスを設定..." Click="SetMonoGameViewerPath_Click" />
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
         <TextBlock Grid.Column="6"
                    Text="{Binding StatusText}"
                    Foreground="#e5e7eb"

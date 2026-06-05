@@ -134,7 +134,87 @@
 - manifest codecは `ogg-vorbis` として扱う
 - Viewer再生に `NAudio.Vorbis` を追加
 - `.ogg` は `VorbisWaveReader`、その他はMedia Foundationで読むよう分岐
-- 既知問題: 初回再生ボタン押下時は音源キャッシュ作成が走るため待ち時間が長い
+- 既知問題: OGG音源が多い譜面ではbackground準備中に未準備音源へ到達すると一部発音が遅れる、または欠ける可能性がある
+
+## 再生開始待ち時間の軽減
+
+- プロジェクト読み込み直後の全音源キャッシュウォームアップを停止
+- 再生開始時に `PlaybackSession.Events` から選択中譜面で使う `audioId` だけを抽出
+- `NbmsAudioCache.Create` に必要 `audioId` フィルタを追加し、未選択譜面や未使用音源を展開しないよう変更
+- OGG一時WAV変換も選択中譜面で必要な音源だけに制限
+- Viewer上部に `Audio preparing...` の最小進捗表示を追加
+- 選択譜面変更時は古い音源キャッシュを破棄し、次回再生時に新しい譜面用に準備し直す
+- duration未設定音源はキャッシュ作成後にdurationを読めるため、音源準備後にPlaybackSessionを再構築するよう変更
+- 再生開始時のblocking準備を曲頭約6秒分の音源に限定
+- 曲頭以降の音源は再生開始後にbackgroundで準備
+- background準備は譜面上の発音順を優先して処理
+- 音割れ軽減のため、one-shot音量を下げ、出力段をsoft clipから簡易limiterへ変更
+- OGG/Vorbis音源はキャッシュ作成時に一時WAVへ全展開せず、抽出したOGGファイルを直接stream再生する方式へ変更
+- background準備を1音源単位に分割し、緊急準備が割り込みやすいよう調整
+- 再生位置から約4秒以内に来る未準備音源を検出し、urgent準備として優先投入
+- 発音時点でも未準備だった音源は、最後の保険として単体即時準備してから再生を試行
+- OGG再生時の先頭ノイズ軽減のため、one-shot再生経路に約3msの短いfade-inを追加
+- Viewerログは初期状態で非表示にし、ログ非表示時は従来通りログ出力も抑制
+- 描画・発音イベントの基準時刻をStopwatch中心から音声出力のsample frame count由来へ変更
+- ViewerのPlayheadTickと再生時刻表示は音声クロックを参照して更新
+- 発音イベントのlookaheadを250msへ戻し、OGG Reader生成やdecode開始の遅延を吸収しやすく調整
+- 曲頭の短音は再生開始前にPCM preloadし、background/urgentで準備した短音も抽出直後にpreloadするよう変更
+- OGG大量譜面では、残課題として同時発音数が多い箇所のdecode/preload追従性をさらに検証する必要あり
+- `PlaybackAssetPlan` を `ShortPcm` / `LongStream` に分類するよう変更
+- Noteで使われる12秒以下またはduration不明の音源は `ShortPcm` としてPCM cache対象にする
+- BGMや12秒超の長尺音源は `LongStream` としてstream routeを許可
+- `ShortPcm` 音源は発音時にstream fallbackしないよう変更
+- `ShortPcm` 発音時に未preloadの場合は、最後の保険として単体PCM preloadを試みる
+- OGG音源でPCM preloadが間に合わない場合にobject音が無音になる問題を避けるため、`ShortPcm`未準備時は `emergency-stream` として救済再生するよう変更
+- OGG短音のPCM decode失敗を減らすため、`ShortPcm`分類とpreload decode上限を12秒から30秒へ拡張
+- OGG短音がある譜面では、曲頭だけでなくobjectに割り当てられた `ShortPcm` 音源全体を再生開始前のstartup cache/preload対象に変更
+- OGG判定はmanifest codecだけでなく `.ogg` / `.oga` 拡張子でも行う
+
+## MonoGame Viewer試作
+
+- `NBMS.Studio.MonoGameViewer` プロジェクトを追加
+- `MonoGame.Framework.WindowsDX` を利用した別プロセスViewerとして構成
+- NBMSヘッダーと譜面IDを引数で受け取り、選択譜面を読み込む
+- 高FPS game loopでレーン、小節線、object、判定線を描画
+- 7keys / 14keysの基本レーン配置に対応
+- Studio本体のメニューとツールバーに `MonoGame Viewer` 起動導線を追加
+- 黒画面に見えやすい状態を避けるため、上部にピクセル文字の診断表示を追加
+- 譜面ロード状態、note数、measure数、HiSpeed操作を画面内に表示
+- レーン配色と外枠を明るめに調整し、譜面未ロード時でもプレイフィールドを視認しやすく変更
+- 14keysの `scratch2` と `key8..key14` の表示位置をEditor/Viewer側のレーン順に合わせて修正
+- Studioからの起動時は、build済み `NBMS.Studio.MonoGameViewer.exe` を優先して直接起動するよう変更
+- README / Build手順にMonoGame Viewer projectのrestore/build/publishを追記
+- StudioからMonoGame Viewerを起動する際、起動済みプロセスを保持して多重起動を抑制
+- MonoGame Viewerのウィンドウが一定時間表示されない場合は、バックグラウンドに残ったプロセスを自動停止
+- Studio終了時に起動中のMonoGame Viewerも閉じるよう変更
+- MonoGame Viewer起動前例外を `%TEMP%\NBMS.Studio.MonoGameViewer.log` に出力
+- MonoGame Viewerのentry pointを明示的な `[STAThread]` `Main` に変更
+- MonoGame Viewerの通常起動経路でも `%TEMP%\NBMS.Studio.MonoGameViewer.log` に起動引数と初期化状態を記録
+- Studio側のViewer起動監視を約6秒から約20秒へ延長し、DirectX/MonoGame初期化待ちを許容
+- MonoGame Viewerのプロジェクト読み込みを軽量化し、音源manifest/hash検証を行わずヘッダーJSONと譜面JSONだけを読むよう変更
+- MonoGame Viewerの初期化スレッドが `audio.nbma` hash計算で止まり、ウィンドウが表示されない問題を修正
+- `MonoGame.Framework.WindowsDX` のWinForms土台を明示するため、MonoGame Viewer projectに `UseWindowsForms=true` を追加
+- MonoGame ViewerにNAudio / NAudio.Vorbisを追加し、`.nbma` から必要音源を一時展開してone-shot再生する最小音声ルートを実装
+- MonoGame Viewerの音声再生を「発音時にdecode」から「起動時にPCM preloadし、少し先の発音時刻へ予約投入」する方式へ変更
+- WAV/OGGとも発音タイミングでreader生成・decodeを行わない経路を優先し、発音遅延とOGGノイズを軽減
+- 同時発音時のクリップを抑えるため、MonoGame Viewer音声mixer出力へ簡易limiterを追加
+- Viewer画面に譜面情報、発音ログ、直近object情報、combo表示を追加
+- objectが判定ラインへ到達したタイミングでcombo加算と判定ライン発光エフェクトを表示
+- 判定ライン発光エフェクトを全レーン表示からobjectが到達したレーンのみの表示へ変更
+- MonoGame Viewerの `8` キーでobjectエフェクトON/OFF、`9` キーでログ表示ON/OFFを切り替え
+- スクロール時刻を `GameTime` 加算から `Stopwatch` 基準へ変更し、フレーム揺れによるスクロールのガタつきを軽減
+- 現時点では描画ループと最小音声再生の検証用で、audio clockを主時計にした厳密同期は未接続
+- 判定ライン到達時のobjectエフェクトはいったん無効化し、`8` キーのeffect切り替え表示も削除
+- MonoGame Viewerの矩形描画を整数 `Rectangle` 指定からfloat座標のSpriteBatch描画へ変更し、スクロール座標の整数丸めによるコマ送り感を軽減
+- MonoGame Viewerに `7` キーで `LOCK60` / `LOCK120` / `UNLIMIT` を切り替えるFPS制限モードを追加し、画面内とWindow titleに現在FPSとモードを表示
+- ログ非表示時はViewer内ログとファイルログの出力を抑制し、音数が多い譜面で発音イベントごとのI/Oがスクロールへ影響しないよう変更
+- MonoGame Viewerの左情報パネルから直近objectの `OBJ ...` 表示を削除
+- Studio本体のメニューとツールバーから旧Avalonia Viewer起動ボタンを非表示化し、EditorからのViewer起動導線をMonoGame Viewerに寄せる
+- MonoGame Viewerの14keys表示時はCOMBO/FPS/AUDIO情報を上部ステータス帯へ移動し、レーンと重ならないよう調整
+- MonoGame Viewerの14keysレーン配置を `scratch, key1..key7, key8..key14, scratch2` に変更し、2P側スクラッチを右端の赤レーンとして表示
+- BMS変換時のheader BPM min/maxを譜面内のBPM timingイベントから再計算し、チャンネル03/08由来のBPM変化もmetadataへ反映
+- CoreのTimelineServiceにBPM/STOP込みのtick秒変換APIを追加し、MonoGame Viewerのnote/BGM/小節線の秒位置計算を初期BPM推定から共通変換へ変更
+- 旧PlaybackSessionの末尾tick推定も初期BPM固定ではなく、譜面末尾時点のBPMからticks/secを解決するよう変更
 
 ## まだ未実装・未検討
 
