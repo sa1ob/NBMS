@@ -63,4 +63,14 @@ public sealed class TimelineRow
     public string Kind { get; set; } = "";
     public string Lane { get; set; } = "";
     public string Detail { get; set; } = "";
+    public int? DurationTicks { get; set; }
+}
+
+public sealed class EventRow
+{
+    public int Tick { get; set; }
+    public double TimeSeconds { get; set; }
+    public string Type { get; set; } = "";
+    public string Lane { get; set; } = "";
+    public string Detail { get; set; } = "";
 }

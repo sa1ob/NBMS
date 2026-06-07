@@ -1,5 +1,11 @@
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Threading;
+using NBMS.Studio.App.Controls;
+using NBMS.Studio.App.Import;
 using NBMS.Studio.App.ViewModels;
 
 namespace NBMS.Studio.App.Views;
@@ -8,11 +14,15 @@ public sealed partial class MainWindow : Window
 {
     private readonly MainWindowViewModel _viewModel = new();
     private PlaybackWindow? _playbackWindow;
+    private bool _pendingScrollEditorTimelineToMeasureZero;
+    private int _editorTimelineScrollRequestId;
 
     public MainWindow()
     {
         InitializeComponent();
         DataContext = _viewModel;
+        EditorTimelineCanvas.TimelineHit += EditorTimelineCanvas_TimelineHit;
+        KeyDown += MainWindow_KeyDown;
     }
 
     private async void OpenNbms_Click(object? sender, RoutedEventArgs e)
@@ -34,6 +44,7 @@ public sealed partial class MainWindow : Window
         if (file?.Path.LocalPath is { Length: > 0 } path)
         {
             await RunUiTaskAsync(() => _viewModel.OpenProjectAsync(path));
+            QueueScrollEditorTimelineToMeasureZero();
         }
     }
 
@@ -77,6 +88,23 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        BmsFolderConversionOptions? options;
+        try
+        {
+            var preview = await _viewModel.PreviewBmsFolderConversionAsync(sourcePath);
+            options = await ShowBmsConversionPreviewDialogAsync(preview);
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorAsync(ex.Message);
+            return;
+        }
+
+        if (options is null)
+        {
+            return;
+        }
+
         var folders = await StorageProvider.OpenFolderPickerAsync(new Avalonia.Platform.Storage.FolderPickerOpenOptions
         {
             Title = "Select NBMS Output Folder",
@@ -86,7 +114,44 @@ public sealed partial class MainWindow : Window
         var outputFolder = folders.FirstOrDefault();
         if (outputFolder?.Path.LocalPath is { Length: > 0 } outputPath)
         {
-            await RunUiTaskAsync(() => _viewModel.ConvertBmsFolderAsync(sourcePath, outputPath));
+            await RunUiTaskAsync(() => _viewModel.ConvertBmsFolderAsync(sourcePath, outputPath, options));
+            QueueScrollEditorTimelineToMeasureZero();
+        }
+    }
+
+    private void ChartSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        QueueScrollEditorTimelineToMeasureZero();
+    }
+
+    private void EditorTimelineScrollViewer_Loaded(object? sender, RoutedEventArgs e)
+    {
+        QueueScrollEditorTimelineToMeasureZero();
+    }
+
+    private void EditorTimelineCanvas_SizeChanged(object? sender, SizeChangedEventArgs e)
+    {
+        if (_pendingScrollEditorTimelineToMeasureZero ||
+            Math.Abs(e.PreviousSize.Height - e.NewSize.Height) > 0.5)
+        {
+            QueueScrollEditorTimelineToMeasureZero();
+        }
+    }
+
+    private void EditorTimelineCanvas_TimelineHit(object? sender, TimelineHitEventArgs e)
+    {
+        _viewModel.SetEditorTimelineDraftFromHit(e.Tick, e.Lane);
+        if (e.Button == TimelineHitButton.Right)
+        {
+            _viewModel.DeleteTimelineObjectFromHit(e.Tick, e.Lane);
+        }
+        else if (e.ClickCount >= 2)
+        {
+            _viewModel.AddTimelineObjectFromHit(e.Tick, e.Lane);
+        }
+        else
+        {
+            _viewModel.SelectTimelineObjectFromHit(e.Tick, e.Lane);
         }
     }
 
@@ -103,6 +168,55 @@ public sealed partial class MainWindow : Window
     private void DeleteNote_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.DeleteSelectedNote();
+    }
+
+    private void Undo_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.UndoEditorCommand();
+    }
+
+    private void Redo_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.RedoEditorCommand();
+    }
+
+    private void Copy_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.CopyEditorObject();
+    }
+
+    private void Paste_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.PasteEditorObject();
+    }
+
+    private void MainWindow_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyModifiers != KeyModifiers.Control)
+        {
+            return;
+        }
+
+        if (e.Key == Key.Z)
+        {
+            _viewModel.UndoEditorCommand();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Y)
+        {
+            _viewModel.RedoEditorCommand();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.C)
+        {
+            _viewModel.CopyEditorObject();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.V)
+        {
+            _viewModel.PasteEditorObject();
+            e.Handled = true;
+        }
     }
 
     private void Play_Click(object? sender, RoutedEventArgs e)
@@ -191,6 +305,133 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async Task<BmsFolderConversionOptions?> ShowBmsConversionPreviewDialogAsync(BmsFolderConversionPreview preview)
+    {
+        var titleBox = new TextBox
+        {
+            Text = preview.SuggestedTitle,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var levelNameBoxes = new List<(string BmsPath, TextBox TextBox)>();
+        var chartPanel = new StackPanel { Spacing = 8 };
+
+        foreach (var chart in preview.Charts)
+        {
+            var levelNameBox = new TextBox
+            {
+                Text = chart.SuggestedLevelName,
+                HorizontalAlignment = HorizontalAlignment.Stretch
+            };
+            levelNameBoxes.Add((chart.BmsPath, levelNameBox));
+
+            var eventSummary = $"BPM:{chart.BpmEventCount} STOP:{chart.StopEventCount} LN:{chart.HoldNoteCount}";
+            if (!string.IsNullOrWhiteSpace(chart.LnObj))
+            {
+                eventSummary += $" LNOBJ:{chart.LnObj}";
+            }
+
+            chartPanel.Children.Add(new Border
+            {
+                BorderBrush = Brushes.LightGray,
+                BorderThickness = new Avalonia.Thickness(1),
+                Padding = new Avalonia.Thickness(8),
+                Child = new StackPanel
+                {
+                    Spacing = 4,
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = $"{Path.GetFileName(chart.BmsPath)} / {chart.Mode} / Lv.{chart.Difficulty}",
+                            FontWeight = FontWeight.SemiBold
+                        },
+                        new TextBlock
+                        {
+                            Text = $"Original title: {chart.OriginalTitle}",
+                            TextWrapping = TextWrapping.Wrap
+                        },
+                        new TextBlock
+                        {
+                            Text = eventSummary,
+                            Foreground = Brushes.DimGray
+                        },
+                        levelNameBox
+                    }
+                }
+            });
+        }
+
+        BmsFolderConversionOptions? result = null;
+        var okButton = new Button { Content = "Convert", MinWidth = 96 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 96 };
+        var dialog = new Window
+        {
+            Title = "BMS Conversion Preview",
+            Width = 760,
+            Height = 560,
+            MinWidth = 640,
+            MinHeight = 420
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            result = new BmsFolderConversionOptions(
+                titleBox.Text?.Trim() ?? preview.SuggestedTitle,
+                levelNameBoxes.ToDictionary(
+                    item => item.BmsPath,
+                    item => item.TextBox.Text?.Trim() ?? "",
+                    StringComparer.OrdinalIgnoreCase));
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+
+        dialog.Content = new Grid
+        {
+            Margin = new Avalonia.Thickness(16),
+            RowDefinitions = new RowDefinitions("Auto,Auto,*,Auto"),
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = "Common title and chart level names were inferred from BMS titles. Edit them before conversion.",
+                    TextWrapping = TextWrapping.Wrap
+                },
+                BuildDialogRow(1, new StackPanel
+                {
+                    Spacing = 4,
+                    Margin = new Avalonia.Thickness(0, 12, 0, 12),
+                    Children =
+                    {
+                        new TextBlock { Text = "Song title", FontWeight = FontWeight.SemiBold },
+                        titleBox
+                    }
+                }),
+                BuildDialogRow(2, new ScrollViewer
+                {
+                    VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+                    Content = chartPanel
+                }),
+                BuildDialogRow(3, new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Spacing = 8,
+                    Margin = new Avalonia.Thickness(0, 12, 0, 0),
+                    Children = { cancelButton, okButton }
+                })
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private static Control BuildDialogRow(int row, Control control)
+    {
+        Grid.SetRow(control, row);
+        return control;
+    }
+
     private async Task RunUiTaskAsync(Func<Task> action)
     {
         try
@@ -200,6 +441,46 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             await ShowErrorAsync(ex.Message);
+        }
+    }
+
+    private void QueueScrollEditorTimelineToMeasureZero()
+    {
+        var requestId = ++_editorTimelineScrollRequestId;
+        _pendingScrollEditorTimelineToMeasureZero = true;
+        Dispatcher.UIThread.Post(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Loaded);
+        Dispatcher.UIThread.Post(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Render);
+        _ = RetryScrollEditorTimelineToMeasureZeroAsync(requestId);
+    }
+
+    private async Task RetryScrollEditorTimelineToMeasureZeroAsync(int requestId)
+    {
+        var delays = new[] { 50, 150, 300, 600 };
+        foreach (var delay in delays)
+        {
+            await Task.Delay(delay);
+            await Dispatcher.UIThread.InvokeAsync(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Background);
+        }
+    }
+
+    private void ScrollEditorTimelineToMeasureZero(int requestId)
+    {
+        if (requestId != _editorTimelineScrollRequestId)
+        {
+            return;
+        }
+
+        EditorTimelineScrollViewer.UpdateLayout();
+        var maxOffsetY = Math.Max(
+            0,
+            EditorTimelineScrollViewer.Extent.Height - EditorTimelineScrollViewer.Viewport.Height);
+
+        EditorTimelineScrollViewer.Offset = new Avalonia.Vector(EditorTimelineScrollViewer.Offset.X, maxOffsetY);
+        if (EditorTimelineScrollViewer.Extent.Height > 0 &&
+            EditorTimelineScrollViewer.Viewport.Height > 0 &&
+            Math.Abs(EditorTimelineScrollViewer.Offset.Y - maxOffsetY) < 1)
+        {
+            _pendingScrollEditorTimelineToMeasureZero = false;
         }
     }
 

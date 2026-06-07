@@ -236,7 +236,7 @@ public sealed partial class BmsImportService
 
     private static NbmsChart CreateBaseChart(BmsImportDocument doc, string mode)
     {
-        return new NbmsChart
+        var chart = new NbmsChart
         {
             ChartId = "main",
             Mode = mode,
@@ -247,6 +247,13 @@ public sealed partial class BmsImportService
                 new() { Tick = 0, Type = "bpm", Value = doc.Bpm }
             ]
         };
+
+        if (!string.IsNullOrWhiteSpace(doc.LnObj))
+        {
+            chart.Timing.Add(new TimingEvent { Tick = 0, Type = "lnobj", Event = doc.LnObj });
+        }
+
+        return chart;
     }
 
     private static void AddChannelEvent(
@@ -281,9 +288,11 @@ public sealed partial class BmsImportService
         {
             AddLongNote(chart, longNoteStarts, longLane, tick, longAudioId);
         }
-        else if (NoteChannels.TryGetValue(channel, out var lane) && wavToAudioId.TryGetValue(token, out var audioId))
+        else if (NoteChannels.TryGetValue(channel, out var lane) &&
+                 (wavToAudioId.TryGetValue(token, out var audioId) ||
+                  string.Equals(doc.LnObj, token, StringComparison.Ordinal)))
         {
-            AddNormalOrLnObjNote(doc, chart, lnObjStarts, lane, token, tick, audioId);
+            AddNormalOrLnObjNote(doc, chart, lnObjStarts, lane, token, tick, audioId ?? "");
         }
     }
 
@@ -480,6 +489,7 @@ public sealed partial class BmsImportService
             "bar" => 0,
             "bpm" => 1,
             "stop" => 2,
+            "lnobj" => 3,
             _ => 9
         };
     }

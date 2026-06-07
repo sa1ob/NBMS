@@ -34,6 +34,7 @@ public sealed class ViewerGame : Game
     private List<RenderNote> _notes = [];
     private List<AudioScheduleItem> _audioSchedule = [];
     private List<double> _measureSeconds = [];
+    private List<BpmMarker> _bpmMarkers = [];
     private List<string> _statusLines = [];
     private readonly Queue<string> _logLines = [];
     private readonly Stopwatch _playbackClock = new();
@@ -230,9 +231,24 @@ public sealed class ViewerGame : Game
             measureTicks.Add(tick);
         }
 
+        var noteTicks = chart.Notes.Select(note => note.Tick);
+        var holdEndTicks = chart.Notes
+            .Where(note => note.DurationTicks is > 0)
+            .Select(note => note.Tick + note.DurationTicks!.Value);
+        var bpmEvents = chart.Timing
+            .Where(timing => timing.Type == "bpm" && timing.Value is not null)
+            .OrderBy(timing => timing.Tick)
+            .ToList();
+        if (bpmEvents.Count == 0)
+        {
+            bpmEvents.Add(new TimingEvent { Tick = 0, Type = "bpm", Value = 120 });
+        }
+
         var secondsByTick = _timelineService.BuildTickTimeMap(
             chart,
-            chart.Notes.Select(note => note.Tick)
+            noteTicks
+                .Concat(holdEndTicks)
+                .Concat(bpmEvents.Select(timing => timing.Tick))
                 .Concat(chart.BackgroundAudio.Select(item => item.Tick))
                 .Concat(measureTicks));
 
@@ -241,6 +257,7 @@ public sealed class ViewerGame : Game
                 note.Tick,
                 ResolveLaneIndex(note.Lane),
                 secondsByTick[note.Tick],
+                note.DurationTicks is > 0 ? secondsByTick[note.Tick + note.DurationTicks!.Value] : secondsByTick[note.Tick],
                 note.Type ?? "tap",
                 note.AudioId ?? ""))
             .Where(note => note.LaneIndex >= 0)
@@ -274,6 +291,11 @@ public sealed class ViewerGame : Game
         {
             _measureSeconds.Add(secondsByTick[tick]);
         }
+
+        _bpmMarkers = bpmEvents
+            .Select(timing => new BpmMarker(secondsByTick[timing.Tick], timing.Value!.Value))
+            .OrderBy(marker => marker.TimeSeconds)
+            .ToList();
     }
 
     private void LoadAudioBank(NbmsHeader header, string rootDirectory)
@@ -380,21 +402,46 @@ public sealed class ViewerGame : Game
         foreach (var note in _notes)
         {
             var y = judgeY - (float)(note.TimeSeconds - _playbackSeconds) * speed;
-            if (y < top - 16 || y > bottom + 16)
+            var endY = judgeY - (float)(note.EndTimeSeconds - _playbackSeconds) * speed;
+            var visibleTop = Math.Min(y, endY);
+            var visibleBottom = Math.Max(y, endY);
+            if (visibleBottom < top - 16 || visibleTop > bottom + 16)
             {
                 continue;
             }
 
             var x = ResolveLaneX(left, note.LaneIndex, is14K);
-            var noteColor = note.Type.Equals("hold", StringComparison.OrdinalIgnoreCase)
-                ? new Color(80, 180, 255)
-                : ResolveNoteColor(note.LaneIndex, is14K);
-            DrawRect(x + 4, y - 5, LaneWidth - 9, 10, noteColor);
-            DrawRect(x + 4, y - 5, LaneWidth - 9, 1.5f, Color.White);
-            DrawRect(x + 4, y + 4, LaneWidth - 9, 1.5f, new Color(60, 60, 60));
+            var noteColor = ResolveNoteColor(note.LaneIndex, is14K);
+            if (note.Type.Equals("hold", StringComparison.OrdinalIgnoreCase) && note.EndTimeSeconds > note.TimeSeconds)
+            {
+                DrawLongNote(x, y, endY, noteColor);
+            }
+            else
+            {
+                DrawRect(x + 4, y - 5, LaneWidth - 9, 10, noteColor);
+                DrawRect(x + 4, y - 5, LaneWidth - 9, 1.5f, Color.White);
+                DrawRect(x + 4, y + 4, LaneWidth - 9, 1.5f, new Color(60, 60, 60));
+            }
         }
 
         DrawRect(left, judgeY, playfieldWidth, 4, new Color(255, 48, 48));
+    }
+
+    private void DrawLongNote(float laneX, float startY, float endY, Color noteColor)
+    {
+        var x = laneX + 4;
+        var width = LaneWidth - 9;
+        var top = Math.Min(startY, endY);
+        var height = Math.Max(8f, Math.Abs(endY - startY));
+        var bodyColor = new Color(noteColor.R, noteColor.G, noteColor.B, (byte)135);
+
+        DrawRect(x, top, width, height, bodyColor);
+        DrawRect(x, startY - 5, width, 10, noteColor);
+        DrawRect(x, endY - 5, width, 10, bodyColor);
+        DrawRect(x, startY - 5, width, 1.5f, Color.White);
+        DrawRect(x, startY + 4, width, 1.5f, new Color(60, 60, 60));
+        DrawRect(x, endY - 5, width, 1.5f, Color.White);
+        DrawRect(x, endY + 4, width, 1.5f, new Color(60, 60, 60));
     }
 
     private void DrawStatusOverlay()
@@ -424,11 +471,12 @@ public sealed class ViewerGame : Game
             return;
         }
 
-        DrawRect(12, 56, 240, 128, new Color(10, 14, 22, 220));
-        DrawText($"COMBO {_combo}", 24, 68, 3f, new Color(255, 235, 110));
+        DrawRect(12, 56, 300, 144, new Color(10, 14, 22, 220));
+        DrawText($"{_combo} COMBO / {_notes.Count} NOTES", 24, 68, 2f, new Color(255, 235, 110));
         DrawText($"TIME {_playbackSeconds:0.000}", 24, 96, 2f, new Color(220, 230, 245));
-        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", 24, 116, 2f, new Color(180, 220, 255));
-        DrawText($"AUDIO {_nextAudioIndex}/{_audioSchedule.Count}", 24, 136, 2f, new Color(180, 220, 255));
+        DrawText($"BPM {ResolveCurrentBpm():0.##}", 24, 116, 2f, new Color(255, 190, 120));
+        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", 24, 136, 2f, new Color(180, 220, 255));
+        DrawText($"AUDIO {_nextAudioIndex}/{_audioSchedule.Count}", 24, 156, 2f, new Color(180, 220, 255));
 
         if (_isLogVisible)
         {
@@ -448,9 +496,9 @@ public sealed class ViewerGame : Game
         var panelWidth = 330f;
         var x = Math.Max(12f, viewport.Width - panelWidth - 12f);
         DrawRect(x, 12, panelWidth, 31, new Color(10, 14, 22, 230));
-        DrawText($"COMBO {_combo}", x + 10, 18, 1.5f, new Color(255, 235, 110));
-        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", x + 118, 18, 1.5f, new Color(180, 220, 255));
-        DrawText($"AUDIO {_nextAudioIndex}/{_audioSchedule.Count}", x + 10, 31, 1.5f, new Color(180, 220, 255));
+        DrawText($"{_combo} COMBO / {_notes.Count} NOTES", x + 10, 18, 1.5f, new Color(255, 235, 110));
+        DrawText($"BPM {ResolveCurrentBpm():0.##}", x + 10, 31, 1.5f, new Color(255, 190, 120));
+        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", x + 118, 31, 1.5f, new Color(180, 220, 255));
 
         if (_isLogVisible)
         {
@@ -527,6 +575,27 @@ public sealed class ViewerGame : Game
             FpsLimitMode.Fixed120 => "LOCK120",
             _ => "UNLIMIT"
         };
+    }
+
+    private double ResolveCurrentBpm()
+    {
+        if (_bpmMarkers.Count == 0)
+        {
+            return 120;
+        }
+
+        var current = _bpmMarkers[0].Bpm;
+        foreach (var marker in _bpmMarkers)
+        {
+            if (marker.TimeSeconds > _playbackSeconds)
+            {
+                break;
+            }
+
+            current = marker.Bpm;
+        }
+
+        return current;
     }
 
     private bool IsCurrentChart14K()
@@ -708,7 +777,15 @@ public sealed class ViewerGame : Game
         ['Z'] = ["11111", "00001", "00010", "00100", "01000", "10000", "11111"]
     };
 
-    private sealed record RenderNote(int Tick, int LaneIndex, double TimeSeconds, string Type, string AudioId);
+    private sealed record RenderNote(
+        int Tick,
+        int LaneIndex,
+        double TimeSeconds,
+        double EndTimeSeconds,
+        string Type,
+        string AudioId);
+
+    private sealed record BpmMarker(double TimeSeconds, double Bpm);
 
     private static void AppendViewerLog(string message)
     {

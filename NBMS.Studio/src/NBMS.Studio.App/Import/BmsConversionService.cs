@@ -45,6 +45,7 @@ public sealed class BmsConversionService
     public async Task<BmsFolderConversionResult> ConvertFolderAsync(
         string bmsDirectory,
         string outputDirectory,
+        BmsFolderConversionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
         var sourceRoot = Path.GetFullPath(bmsDirectory);
@@ -53,11 +54,7 @@ public sealed class BmsConversionService
         Directory.CreateDirectory(outputRoot);
         Directory.CreateDirectory(scoreDirectory);
 
-        var bmsFiles = BmsPatterns
-            .SelectMany(pattern => Directory.EnumerateFiles(sourceRoot, pattern, SearchOption.TopDirectoryOnly))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var bmsFiles = EnumerateBmsFiles(sourceRoot);
 
         if (bmsFiles.Count == 0)
         {
@@ -74,6 +71,7 @@ public sealed class BmsConversionService
         }
 
         var header = BuildMergedHeader(sourceRoot, importedFiles);
+        ApplyFolderConversionOptions(header, options);
         var audioPath = Path.Combine(outputRoot, "audio.nbma");
         var headerPath = Path.Combine(outputRoot, "song.nbmh");
         var audioSources = BuildMergedAudioSources(importedFiles);
@@ -100,7 +98,7 @@ public sealed class BmsConversionService
                 File = chartRelativePath,
                 Mode = string.IsNullOrWhiteSpace(sourceReference.Mode) ? imported.ImportResult.Chart.Mode : sourceReference.Mode,
                 Difficulty = sourceReference.Difficulty,
-                LevelName = ResolveLevelName(imported.BmsPath, sourceReference),
+                LevelName = ResolveLevelName(imported.BmsPath, sourceReference, options),
                 Hash = _hashService.ComputeCanonicalJsonHash(imported.ImportResult.Chart),
                 HashAlgorithm = "sha256-canonical-json"
             });
@@ -112,6 +110,51 @@ public sealed class BmsConversionService
         await NbmsJson.WriteAsync(headerPath, header, cancellationToken);
 
         return new BmsFolderConversionResult(results);
+    }
+
+    public async Task<BmsFolderConversionPreview> PreviewFolderAsync(
+        string bmsDirectory,
+        CancellationToken cancellationToken = default)
+    {
+        var sourceRoot = Path.GetFullPath(bmsDirectory);
+        var bmsFiles = EnumerateBmsFiles(sourceRoot);
+
+        if (bmsFiles.Count == 0)
+        {
+            throw new InvalidDataException("No BMS chart files were found in the selected folder.");
+        }
+
+        var importedFiles = new List<ImportedBms>();
+        foreach (var bmsPath in bmsFiles)
+        {
+            importedFiles.Add(new ImportedBms(
+                bmsPath,
+                await _importService.ImportAsync(bmsPath, cancellationToken),
+                new Dictionary<string, string>(StringComparer.Ordinal)));
+        }
+
+        var commonTitle = ResolveCommonTitle(importedFiles);
+        var charts = importedFiles
+            .Select(imported =>
+            {
+                var chart = imported.ImportResult.Chart;
+                var sourceReference = imported.ImportResult.Header.Charts.FirstOrDefault() ?? new ChartReference();
+                var originalTitle = imported.ImportResult.Header.Title;
+                var fallbackName = ResolveBaseLevelName(imported.BmsPath, sourceReference);
+                return new BmsChartConversionPreview(
+                    Path.GetFullPath(imported.BmsPath),
+                    originalTitle,
+                    ResolveSuggestedLevelName(originalTitle, commonTitle, fallbackName),
+                    string.IsNullOrWhiteSpace(sourceReference.Mode) ? chart.Mode : sourceReference.Mode,
+                    sourceReference.Difficulty,
+                    chart.Timing.Count(timing => timing.Type == "bpm"),
+                    chart.Timing.Count(timing => timing.Type == "stop"),
+                    chart.Notes.Count(note => note.Type == "hold"),
+                    chart.Timing.FirstOrDefault(timing => timing.Type == "lnobj")?.Event ?? "");
+            })
+            .ToList();
+
+        return new BmsFolderConversionPreview(sourceRoot, commonTitle, charts);
     }
 
     private NbmsHeader BuildMergedHeader(string sourceRoot, IReadOnlyList<ImportedBms> importedFiles)
@@ -319,11 +362,105 @@ public sealed class BmsConversionService
         return candidate;
     }
 
-    private static string ResolveLevelName(string bmsPath, ChartReference sourceReference)
+    private static List<string> EnumerateBmsFiles(string sourceRoot)
+    {
+        return BmsPatterns
+            .SelectMany(pattern => Directory.EnumerateFiles(sourceRoot, pattern, SearchOption.TopDirectoryOnly))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void ApplyFolderConversionOptions(NbmsHeader header, BmsFolderConversionOptions? options)
+    {
+        if (!string.IsNullOrWhiteSpace(options?.Title))
+        {
+            header.Title = options.Title.Trim();
+        }
+    }
+
+    private static string ResolveLevelName(
+        string bmsPath,
+        ChartReference sourceReference,
+        BmsFolderConversionOptions? options)
+    {
+        if (options is not null &&
+            options.LevelNames.TryGetValue(Path.GetFullPath(bmsPath), out var levelName) &&
+            !string.IsNullOrWhiteSpace(levelName))
+        {
+            return levelName.Trim();
+        }
+
+        return ResolveBaseLevelName(bmsPath, sourceReference);
+    }
+
+    private static string ResolveBaseLevelName(string bmsPath, ChartReference sourceReference)
     {
         return string.IsNullOrWhiteSpace(sourceReference.LevelName)
             ? Path.GetFileNameWithoutExtension(bmsPath)
             : sourceReference.LevelName;
+    }
+
+    private static string ResolveCommonTitle(IReadOnlyList<ImportedBms> importedFiles)
+    {
+        var titles = importedFiles
+            .Select(imported => imported.ImportResult.Header.Title)
+            .Where(title => !string.IsNullOrWhiteSpace(title))
+            .ToList();
+        if (titles.Count == 0)
+        {
+            return "Untitled";
+        }
+
+        var prefix = titles[0];
+        foreach (var title in titles.Skip(1))
+        {
+            prefix = CommonPrefix(prefix, title);
+            if (prefix.Length == 0)
+            {
+                break;
+            }
+        }
+
+        prefix = TrimTitlePart(TrimToLastSeparator(prefix));
+        return string.IsNullOrWhiteSpace(prefix) ? titles[0] : prefix;
+    }
+
+    private static string ResolveSuggestedLevelName(string originalTitle, string commonTitle, string fallback)
+    {
+        var candidate = originalTitle;
+        if (!string.IsNullOrWhiteSpace(commonTitle) &&
+            candidate.StartsWith(commonTitle, StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = candidate[commonTitle.Length..];
+        }
+
+        candidate = TrimTitlePart(candidate);
+        return string.IsNullOrWhiteSpace(candidate) ? fallback : candidate;
+    }
+
+    private static string CommonPrefix(string left, string right)
+    {
+        var length = Math.Min(left.Length, right.Length);
+        var index = 0;
+        while (index < length && char.ToUpperInvariant(left[index]) == char.ToUpperInvariant(right[index]))
+        {
+            index++;
+        }
+
+        return left[..index];
+    }
+
+    private static string TrimToLastSeparator(string value)
+    {
+        var separators = new[] { ' ', '-', '_', '~', ':', '[', '(' };
+        var lastSeparator = value.LastIndexOfAny(separators);
+        return lastSeparator > 0 ? value[..lastSeparator] : value;
+    }
+
+    private static string TrimTitlePart(string value)
+    {
+        return value.Trim().Trim('-', '_', '~', ':', '[', ']', '(', ')').Trim();
     }
 
     private static string SanitizeId(string value)
@@ -360,3 +497,23 @@ public sealed class BmsConversionService
 public sealed record BmsConversionResult(string HeaderPath, string ChartPath, string AudioPath);
 
 public sealed record BmsFolderConversionResult(IReadOnlyList<BmsConversionResult> Results);
+
+public sealed record BmsFolderConversionOptions(
+    string Title,
+    IReadOnlyDictionary<string, string> LevelNames);
+
+public sealed record BmsFolderConversionPreview(
+    string SourceDirectory,
+    string SuggestedTitle,
+    IReadOnlyList<BmsChartConversionPreview> Charts);
+
+public sealed record BmsChartConversionPreview(
+    string BmsPath,
+    string OriginalTitle,
+    string SuggestedLevelName,
+    string Mode,
+    int Difficulty,
+    int BpmEventCount,
+    int StopEventCount,
+    int HoldNoteCount,
+    string LnObj);

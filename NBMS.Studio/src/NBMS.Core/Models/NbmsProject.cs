@@ -39,5 +39,5 @@ public sealed class TimelineItem
     public string Kind { get; set; } = "";
     public string Lane { get; set; } = "";
     public string Detail { get; set; } = "";
+    public int? DurationTicks { get; set; }
 }
-

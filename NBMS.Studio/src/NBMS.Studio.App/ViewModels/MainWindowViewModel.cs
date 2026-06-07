@@ -25,6 +25,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly Queue<string> _playbackLogLines = [];
     private readonly HashSet<string> _urgentAudioPrepareIds = new(StringComparer.Ordinal);
     private readonly object _monoGameViewerLock = new();
+    private readonly Stack<EditorCommand> _undoStack = new();
+    private readonly Stack<EditorCommand> _redoStack = new();
 
     private NbmsProject? _project;
     private LoadedChart? _selectedChart;
@@ -53,6 +55,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private string _licenseText = "";
     private string _projectPathText = "";
     private NoteRow? _selectedNote;
+    private AudioRow? _selectedAudioRow;
     private ChartRow? _selectedChartRow;
     private string _draftTick = "0";
     private string _draftLane = "key1";
@@ -61,13 +64,20 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private string _draftDurationTicks = "";
     private bool _isPlaying;
     private double _playheadTick;
-    private double _editorTimelineHeight = 2400;
+    private double _editorTimelineHeight = 960;
+    private int _editorTimelineStartTick;
+    private int _editorTimelineFocusTick;
+    private int _editorSelectedTick = -1;
+    private string _editorSelectedLane = "";
+    private EditorClipboardItem? _editorClipboard;
+    private int _editorGridDivision = 16;
     private double _viewerHiSpeed = 1.0;
     private string _playbackPositionText = "00:00.000";
     private string _playbackDebugText = "session: none";
     private string _playbackLogText = "";
     private string _audioPreparationText = "";
     private bool _isPlaybackLogVisible;
+    private bool _isApplyingEditorHistory;
 
     public MainWindowViewModel()
     {
@@ -87,7 +97,9 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public ObservableCollection<AudioRow> AudioEntries { get; } = [];
     public ObservableCollection<IssueRow> Issues { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
+    public ObservableCollection<EventRow> Events { get; } = [];
     public ObservableCollection<string> Extensions { get; } = [];
+    public ObservableCollection<int> EditorGridDivisions { get; } = [4, 8, 12, 16, 24, 32, 48, 64];
 
     public string StatusText
     {
@@ -146,6 +158,21 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             DraftType = value.Type;
             DraftAudioId = value.AudioId;
             DraftDurationTicks = value.DurationTicks?.ToString() ?? "";
+        }
+    }
+
+    public AudioRow? SelectedAudioRow
+    {
+        get => _selectedAudioRow;
+        set
+        {
+            if (!SetProperty(ref _selectedAudioRow, value) || value is null)
+            {
+                return;
+            }
+
+            DraftAudioId = value.AudioId;
+            StatusText = $"Selected audio: {value.AudioId}";
         }
     }
 
@@ -253,6 +280,46 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         set => SetProperty(ref _editorTimelineHeight, value);
     }
 
+    public int EditorTimelineStartTick
+    {
+        get => _editorTimelineStartTick;
+        set => SetProperty(ref _editorTimelineStartTick, value);
+    }
+
+    public int EditorTimelineFocusTick
+    {
+        get => _editorTimelineFocusTick;
+        set => SetProperty(ref _editorTimelineFocusTick, value);
+    }
+
+    public int EditorSelectedTick
+    {
+        get => _editorSelectedTick;
+        set => SetProperty(ref _editorSelectedTick, value);
+    }
+
+    public string EditorSelectedLane
+    {
+        get => _editorSelectedLane;
+        set => SetProperty(ref _editorSelectedLane, value);
+    }
+
+    public int EditorGridDivision
+    {
+        get => _editorGridDivision;
+        set
+        {
+            var normalized = EditorGridDivisions.Contains(value) ? value : 16;
+            if (SetProperty(ref _editorGridDivision, normalized))
+            {
+                OnPropertyChanged(nameof(EditorGridTicks));
+                StatusText = $"Grid 1/{normalized}";
+            }
+        }
+    }
+
+    public int EditorGridTicks => ResolveEditorGridTicks();
+
     public double ViewerHiSpeed
     {
         get => _viewerHiSpeed;
@@ -271,6 +338,413 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         ViewerHiSpeed = value;
     }
 
+    public bool CanUndoEditorCommand => _undoStack.Count > 0;
+
+    public bool CanRedoEditorCommand => _redoStack.Count > 0;
+
+    public bool CanPasteEditorObject => _editorClipboard is not null;
+
+    public void SetEditorTimelineDraftFromHit(int tick, string lane)
+    {
+        var snappedTick = SnapEditorTick(tick);
+        DraftTick = snappedTick.ToString();
+        DraftLane = lane;
+        StatusText = $"Editor position: tick {snappedTick}, lane {lane}";
+    }
+
+    public void UndoEditorCommand()
+    {
+        if (_undoStack.Count == 0)
+        {
+            StatusText = "Undoできる編集履歴がありません。";
+            return;
+        }
+
+        var command = _undoStack.Pop();
+        _isApplyingEditorHistory = true;
+        try
+        {
+            command.Undo();
+            _redoStack.Push(command);
+            StatusText = $"Undo: {command.Name}";
+        }
+        finally
+        {
+            _isApplyingEditorHistory = false;
+            NotifyEditorHistoryChanged();
+        }
+    }
+
+    public void RedoEditorCommand()
+    {
+        if (_redoStack.Count == 0)
+        {
+            StatusText = "Redoできる編集履歴がありません。";
+            return;
+        }
+
+        var command = _redoStack.Pop();
+        _isApplyingEditorHistory = true;
+        try
+        {
+            command.Redo();
+            _undoStack.Push(command);
+            StatusText = $"Redo: {command.Name}";
+        }
+        finally
+        {
+            _isApplyingEditorHistory = false;
+            NotifyEditorHistoryChanged();
+        }
+    }
+
+    public void CopyEditorObject()
+    {
+        if (_selectedChart is null || EditorSelectedTick < 0 || string.IsNullOrWhiteSpace(EditorSelectedLane))
+        {
+            StatusText = "コピー対象のオブジェクトが選択されていません。";
+            return;
+        }
+
+        var note = Notes.FirstOrDefault(item =>
+            item.Tick == EditorSelectedTick &&
+            string.Equals(item.Lane, EditorSelectedLane, StringComparison.OrdinalIgnoreCase));
+        if (note is not null)
+        {
+            _editorClipboard = EditorClipboardItem.FromNote(note);
+            NotifyEditorClipboardChanged();
+            StatusText = $"Copied note: tick {note.Tick}, lane {note.Lane}";
+            return;
+        }
+
+        var bgm = _selectedChart.Chart.BackgroundAudio.FirstOrDefault(item =>
+            item.Tick == EditorSelectedTick &&
+            string.Equals(item.Lane ?? "background1", EditorSelectedLane, StringComparison.OrdinalIgnoreCase));
+        if (bgm is not null)
+        {
+            _editorClipboard = EditorClipboardItem.FromBgm(bgm);
+            NotifyEditorClipboardChanged();
+            StatusText = $"Copied BGM: tick {bgm.Tick}, lane {bgm.Lane ?? "background1"}";
+            return;
+        }
+
+        StatusText = "コピー対象のオブジェクトが見つかりません。";
+    }
+
+    public void PasteEditorObject()
+    {
+        if (_selectedChart is null)
+        {
+            return;
+        }
+
+        if (_editorClipboard is null)
+        {
+            StatusText = "貼り付けるオブジェクトがありません。";
+            return;
+        }
+
+        var tick = int.TryParse(DraftTick, out var parsedTick)
+            ? SnapEditorTick(parsedTick)
+            : EditorSelectedTick >= 0 ? EditorSelectedTick : 0;
+        var lane = string.IsNullOrWhiteSpace(DraftLane)
+            ? _editorClipboard.Lane
+            : DraftLane;
+
+        if (_editorClipboard.Kind == EditorClipboardKind.Bgm || lane.StartsWith("background", StringComparison.OrdinalIgnoreCase))
+        {
+            var bgm = new BackgroundAudioEvent
+            {
+                Tick = tick,
+                Lane = lane.StartsWith("background", StringComparison.OrdinalIgnoreCase) ? lane : _editorClipboard.Lane,
+                AudioId = _editorClipboard.AudioId
+            };
+            _selectedChart.Chart.BackgroundAudio.Add(bgm);
+            SelectedNote = null;
+            EditorSelectedTick = bgm.Tick;
+            EditorSelectedLane = bgm.Lane ?? "background1";
+            PushEditorCommand(new EditorCommand(
+                "Paste BGM",
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Remove(bgm);
+                    ClearEditorSelection();
+                    RefreshTimelineOnly();
+                },
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Add(bgm);
+                    SelectedNote = null;
+                    EditorSelectedTick = bgm.Tick;
+                    EditorSelectedLane = bgm.Lane ?? "background1";
+                    RefreshTimelineOnly();
+                }));
+            RefreshTimelineOnly();
+            StatusText = $"Pasted BGM: tick {bgm.Tick}, lane {EditorSelectedLane}";
+            return;
+        }
+
+        if (!IsPlayableEditorLane(lane))
+        {
+            StatusText = $"{lane} レーンにはノートを貼り付けられません。";
+            return;
+        }
+
+        var row = new NoteRow
+        {
+            Tick = tick,
+            Lane = lane,
+            Type = _editorClipboard.Type,
+            AudioId = _editorClipboard.AudioId,
+            DurationTicks = _editorClipboard.DurationTicks
+        };
+        Notes.Add(row);
+        SelectedNote = row;
+        EditorSelectedTick = row.Tick;
+        EditorSelectedLane = row.Lane;
+        PushEditorCommand(new EditorCommand(
+            "Paste Note",
+            () =>
+            {
+                Notes.Remove(row);
+                ClearEditorSelection();
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            },
+            () =>
+            {
+                Notes.Add(row);
+                SelectedNote = row;
+                EditorSelectedTick = row.Tick;
+                EditorSelectedLane = row.Lane;
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            }));
+        ApplyNoteRows();
+        RefreshTimelineOnly();
+        StatusText = $"Pasted note: tick {row.Tick}, lane {row.Lane}";
+    }
+
+    public void SelectTimelineObjectFromHit(int tick, string lane)
+    {
+        if (_selectedChart is null)
+        {
+            return;
+        }
+
+        var snappedTick = SnapEditorTick(tick);
+        var gridHalf = ResolveEditorGridTicks() / 2;
+        var note = Notes
+            .OrderBy(item => Math.Abs(item.Tick - snappedTick))
+            .FirstOrDefault(item =>
+                string.Equals(item.Lane, lane, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs(item.Tick - snappedTick) <= gridHalf);
+
+        if (note is not null)
+        {
+            SelectedNote = note;
+            EditorSelectedTick = note.Tick;
+            EditorSelectedLane = note.Lane;
+            StatusText = $"Selected note: tick {note.Tick}, lane {note.Lane}, audio {note.AudioId}";
+            return;
+        }
+
+        var bgm = _selectedChart.Chart.BackgroundAudio
+            .OrderBy(item => Math.Abs(item.Tick - snappedTick))
+            .FirstOrDefault(item =>
+                string.Equals(item.Lane ?? "background1", lane, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs(item.Tick - snappedTick) <= gridHalf);
+
+        if (bgm is not null)
+        {
+            SelectedNote = null;
+            EditorSelectedTick = bgm.Tick;
+            EditorSelectedLane = bgm.Lane ?? "background1";
+            DraftAudioId = bgm.AudioId;
+            StatusText = $"Selected BGM: tick {bgm.Tick}, lane {EditorSelectedLane}, audio {bgm.AudioId}";
+            return;
+        }
+
+        EditorSelectedTick = -1;
+        EditorSelectedLane = "";
+    }
+
+    public void AddTimelineObjectFromHit(int tick, string lane)
+    {
+        if (_selectedChart is null)
+        {
+            return;
+        }
+
+        var audioId = ResolveEditorAudioId();
+        if (string.IsNullOrWhiteSpace(audioId))
+        {
+            StatusText = "追加するaudioIdがありません。先に音源を選択してください。";
+            return;
+        }
+
+        var snappedTick = SnapEditorTick(tick);
+        if (lane.StartsWith("background", StringComparison.OrdinalIgnoreCase))
+        {
+            var bgm = new BackgroundAudioEvent
+            {
+                Tick = snappedTick,
+                Lane = lane,
+                AudioId = audioId
+            };
+            _selectedChart.Chart.BackgroundAudio.Add(bgm);
+            SelectedNote = null;
+            EditorSelectedTick = bgm.Tick;
+            EditorSelectedLane = bgm.Lane ?? "background1";
+            PushEditorCommand(new EditorCommand(
+                "Add BGM",
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Remove(bgm);
+                    ClearEditorSelection();
+                    RefreshTimelineOnly();
+                },
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Add(bgm);
+                    SelectedNote = null;
+                    EditorSelectedTick = bgm.Tick;
+                    EditorSelectedLane = bgm.Lane ?? "background1";
+                    RefreshTimelineOnly();
+                }));
+            RefreshTimelineOnly();
+            StatusText = $"BGM object added: tick {snappedTick}, lane {lane}, audio {audioId}";
+            return;
+        }
+
+        if (!IsPlayableEditorLane(lane))
+        {
+            StatusText = $"{lane} レーンの編集は後続Phaseで実装します。";
+            return;
+        }
+
+        var row = new NoteRow
+        {
+            Tick = snappedTick,
+            Lane = lane,
+            Type = "tap",
+            AudioId = audioId
+        };
+
+        Notes.Add(row);
+        SelectedNote = row;
+        EditorSelectedTick = row.Tick;
+        EditorSelectedLane = row.Lane;
+        PushEditorCommand(new EditorCommand(
+            "Add Note",
+            () =>
+            {
+                Notes.Remove(row);
+                ClearEditorSelection();
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            },
+            () =>
+            {
+                Notes.Add(row);
+                SelectedNote = row;
+                EditorSelectedTick = row.Tick;
+                EditorSelectedLane = row.Lane;
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            }));
+        ApplyNoteRows();
+        RefreshTimelineOnly();
+        StatusText = $"Note object added: tick {snappedTick}, lane {lane}, audio {audioId}";
+    }
+
+    public void DeleteTimelineObjectFromHit(int tick, string lane)
+    {
+        if (_selectedChart is null)
+        {
+            return;
+        }
+
+        var snappedTick = SnapEditorTick(tick);
+        if (lane.StartsWith("background", StringComparison.OrdinalIgnoreCase))
+        {
+            var bgm = _selectedChart.Chart.BackgroundAudio
+                .OrderBy(item => Math.Abs(item.Tick - snappedTick))
+                .FirstOrDefault(item =>
+                    string.Equals(item.Lane ?? "background1", lane, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs(item.Tick - snappedTick) <= ResolveEditorGridTicks() / 2);
+            if (bgm is null)
+            {
+                StatusText = $"削除対象がありません: tick {snappedTick}, lane {lane}";
+                return;
+            }
+
+            _selectedChart.Chart.BackgroundAudio.Remove(bgm);
+            EditorSelectedTick = -1;
+            EditorSelectedLane = "";
+            PushEditorCommand(new EditorCommand(
+                "Delete BGM",
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Add(bgm);
+                    SelectedNote = null;
+                    EditorSelectedTick = bgm.Tick;
+                    EditorSelectedLane = bgm.Lane ?? "background1";
+                    RefreshTimelineOnly();
+                },
+                () =>
+                {
+                    _selectedChart.Chart.BackgroundAudio.Remove(bgm);
+                    ClearEditorSelection();
+                    RefreshTimelineOnly();
+                }));
+            RefreshTimelineOnly();
+            StatusText = $"BGM object deleted: tick {bgm.Tick}, lane {lane}";
+            return;
+        }
+
+        var note = Notes
+            .OrderBy(item => Math.Abs(item.Tick - snappedTick))
+            .FirstOrDefault(item =>
+                string.Equals(item.Lane, lane, StringComparison.OrdinalIgnoreCase) &&
+                Math.Abs(item.Tick - snappedTick) <= ResolveEditorGridTicks() / 2);
+        if (note is null)
+        {
+            StatusText = $"削除対象がありません: tick {snappedTick}, lane {lane}";
+            return;
+        }
+
+        Notes.Remove(note);
+        if (ReferenceEquals(SelectedNote, note))
+        {
+            SelectedNote = null;
+        }
+
+        EditorSelectedTick = -1;
+        EditorSelectedLane = "";
+        PushEditorCommand(new EditorCommand(
+            "Delete Note",
+            () =>
+            {
+                Notes.Add(note);
+                SelectedNote = note;
+                EditorSelectedTick = note.Tick;
+                EditorSelectedLane = note.Lane;
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            },
+            () =>
+            {
+                Notes.Remove(note);
+                ClearEditorSelection();
+                ApplyNoteRows();
+                RefreshTimelineOnly();
+            }));
+        ApplyNoteRows();
+        RefreshTimelineOnly();
+        StatusText = $"Note object deleted: tick {note.Tick}, lane {lane}";
+    }
+
     public bool HasProject => _project is not null;
 
     public string ChartSummaryText => _selectedChart is null
@@ -278,6 +752,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         : $"{_selectedChart.Reference.Id} / {_selectedChart.Reference.Mode} / Lv.{_selectedChart.Reference.Difficulty}";
 
     public string AudioSummaryText => $"{AudioEntries.Count} audio";
+
+    public string EventSummaryText => $"{Events.Count} events";
 
     public string IssueSummaryText => Issues.Count == 0 ? "参照切れなし" : $"{Issues.Count}件の確認事項";
 
@@ -513,6 +989,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         _project = await _projectService.OpenHeaderAsync(headerPath);
         _selectedChart = _project.Charts.FirstOrDefault();
         AudioPreparationText = "";
+        ClearEditorHistory();
 
         LoadHeaderFields();
         RefreshCollections();
@@ -631,12 +1108,20 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StatusText = $"BMS変換完了: {result.HeaderPath}";
     }
 
-    public async Task ConvertBmsFolderAsync(string bmsDirectory, string outputDirectory)
+    public Task<BmsFolderConversionPreview> PreviewBmsFolderConversionAsync(string bmsDirectory)
+    {
+        return _bmsConversionService.PreviewFolderAsync(bmsDirectory);
+    }
+
+    public async Task ConvertBmsFolderAsync(
+        string bmsDirectory,
+        string outputDirectory,
+        BmsFolderConversionOptions? options = null)
     {
         StopPlayback();
         StatusText = "BMSフォルダをNBMSへ一括変換しています...";
 
-        var result = await _bmsConversionService.ConvertFolderAsync(bmsDirectory, outputDirectory);
+        var result = await _bmsConversionService.ConvertFolderAsync(bmsDirectory, outputDirectory, options);
         var first = result.Results.FirstOrDefault()
             ?? throw new InvalidDataException("変換対象のBMS譜面がありません。");
 
@@ -659,6 +1144,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StopPlayback();
         CancelAudioCachePreparation();
         ApplyNoteRows();
+        ClearEditorHistory();
         _selectedChart = _project.Charts.FirstOrDefault(chart => chart.Reference.Id == chartId) ?? _project.Charts.FirstOrDefault();
         _audioCache?.Dispose();
         _audioCache = null;
@@ -711,6 +1197,84 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         ApplyNoteRows();
         RefreshTimelineOnly();
         StatusText = "ノーツを追加しました。";
+    }
+
+    private int SnapEditorTick(int tick)
+    {
+        var gridTicks = ResolveEditorGridTicks();
+        return Math.Max(0, (int)Math.Round(tick / (double)gridTicks) * gridTicks);
+    }
+
+    private int ResolveEditorGridTicks()
+    {
+        if (_selectedChart is null)
+        {
+            return 240;
+        }
+
+        const int defaultMeasureTicks = 3840;
+        var measureTicks = _selectedChart.Chart.Resolution > 0
+            ? _selectedChart.Chart.Resolution * 4
+            : defaultMeasureTicks;
+        return Math.Max(1, measureTicks / Math.Max(1, EditorGridDivision));
+    }
+
+    private string ResolveEditorAudioId()
+    {
+        if (!string.IsNullOrWhiteSpace(DraftAudioId))
+        {
+            return DraftAudioId;
+        }
+
+        if (SelectedAudioRow is not null && !string.IsNullOrWhiteSpace(SelectedAudioRow.AudioId))
+        {
+            return SelectedAudioRow.AudioId;
+        }
+
+        return AudioEntries.FirstOrDefault()?.AudioId ?? "";
+    }
+
+    private static bool IsPlayableEditorLane(string lane)
+    {
+        return lane is "scratch" or "scratch2" ||
+               lane.StartsWith("key", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void PushEditorCommand(EditorCommand command)
+    {
+        if (_isApplyingEditorHistory)
+        {
+            return;
+        }
+
+        _undoStack.Push(command);
+        _redoStack.Clear();
+        NotifyEditorHistoryChanged();
+    }
+
+    private void ClearEditorHistory()
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        NotifyEditorHistoryChanged();
+    }
+
+    private void NotifyEditorHistoryChanged()
+    {
+        OnPropertyChanged(nameof(CanUndoEditorCommand));
+        OnPropertyChanged(nameof(CanRedoEditorCommand));
+    }
+
+    private void NotifyEditorClipboardChanged()
+    {
+        OnPropertyChanged(nameof(CanPasteEditorObject));
+    }
+
+    private void ClearEditorSelection()
+    {
+        SelectedNote = null;
+        EditorSelectedTick = -1;
+        EditorSelectedLane = "";
     }
 
     public void ApplyDraftToSelectedNote()
@@ -1036,6 +1600,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         Charts.Clear();
         AudioEntries.Clear();
         Issues.Clear();
+        Events.Clear();
         Extensions.Clear();
 
         if (_project is null)
@@ -1089,6 +1654,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
         RefreshNotesAndTimeline();
         OnPropertyChanged(nameof(AudioSummaryText));
+        OnPropertyChanged(nameof(EventSummaryText));
         OnPropertyChanged(nameof(IssueSummaryText));
         OnPropertyChanged(nameof(ChartSummaryText));
     }
@@ -1112,31 +1678,109 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private void RefreshTimelineOnly()
     {
         Timeline.Clear();
+        Events.Clear();
 
         if (_selectedChart is null)
         {
+            OnPropertyChanged(nameof(EventSummaryText));
             return;
         }
 
         foreach (var item in _timelineService.BuildTimeline(_selectedChart.Chart))
         {
-            Timeline.Add(new TimelineRow
+            var row = new TimelineRow
             {
                 Tick = item.Tick,
                 TimeSeconds = Math.Round(item.TimeSeconds, 3),
                 Kind = item.Kind,
                 Lane = item.Lane,
-                Detail = item.Detail
+                Detail = item.Detail,
+                DurationTicks = item.DurationTicks
+            };
+            Timeline.Add(row);
+
+            if (IsEditorEventRow(row))
+            {
+                Events.Add(new EventRow
+                {
+                    Tick = row.Tick,
+                    TimeSeconds = row.TimeSeconds,
+                    Type = row.Detail.StartsWith("BPM ", StringComparison.Ordinal) ? "BPM" : row.Detail.Split(' ')[0],
+                    Lane = row.Lane,
+                    Detail = row.Detail
+                });
+            }
+        }
+
+        foreach (var note in _selectedChart.Chart.Notes.Where(note => note.Type == "hold"))
+        {
+            var time = Timeline.FirstOrDefault(row => row.Kind == "Note" && row.Tick == note.Tick && row.Lane == note.Lane)?.TimeSeconds ?? 0;
+            Events.Add(new EventRow
+            {
+                Tick = note.Tick,
+                TimeSeconds = time,
+                Type = "LN",
+                Lane = note.Lane,
+                Detail = $"hold {note.DurationTicks ?? 0} ticks {note.AudioId}"
             });
         }
 
         RefreshEditorTimelineHeight();
+        OnPropertyChanged(nameof(EditorGridTicks));
+        OnPropertyChanged(nameof(EventSummaryText));
+    }
+
+    private static bool IsEditorEventRow(TimelineRow row)
+    {
+        if (row.Kind != "Timing")
+        {
+            return false;
+        }
+
+        return row.Detail.StartsWith("BPM ", StringComparison.Ordinal) ||
+               row.Detail.StartsWith("STOP ", StringComparison.Ordinal) ||
+               row.Detail.StartsWith("LNOBJ ", StringComparison.Ordinal);
     }
 
     private void RefreshEditorTimelineHeight()
     {
-        var maxTick = Timeline.Count == 0 ? 0 : Timeline.Max(row => row.Tick);
-        EditorTimelineHeight = Math.Max(2400, 160 + maxTick * 0.125);
+        const int measureTicks = 3840;
+        const double pixelsPerTick = 0.125;
+        var firstContentTick = ResolveEditorTimelineFirstContentTick();
+        // Editorでは最初の実オブジェクトより2小節手前を下端余白として確保する。
+        var startTick = firstContentTick - measureTicks * 2;
+        var maxTick = Timeline.Count == 0
+            ? firstContentTick
+            : Timeline.Max(row => row.Tick + (row.DurationTicks ?? 0));
+
+        EditorTimelineFocusTick = firstContentTick;
+        EditorTimelineStartTick = startTick;
+        EditorTimelineHeight = Math.Max(360, 96 + Math.Max(0, maxTick - startTick) * pixelsPerTick);
+    }
+
+    private int ResolveEditorTimelineFirstContentTick()
+    {
+        if (_selectedChart is null)
+        {
+            return 0;
+        }
+
+        var noteTicks = _selectedChart.Chart.Notes.Select(note => note.Tick);
+        var backgroundTicks = _selectedChart.Chart.BackgroundAudio.Select(item => item.Tick);
+        var timingTicks = _selectedChart.Chart.Timing
+            .Where(timing => timing.Type is "bpm" or "stop" or "scroll" or "speed")
+            .Select(timing => timing.Tick);
+
+        var audioOrNoteTicks = noteTicks
+            .Concat(backgroundTicks)
+            .ToList();
+
+        if (audioOrNoteTicks.Count > 0)
+        {
+            return audioOrNoteTicks.Min();
+        }
+
+        return timingTicks.DefaultIfEmpty(0).Min();
     }
 
     private void BuildPlaybackSchedule()
@@ -1555,5 +2199,41 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StopMonoGameViewer();
         _audioPlayer.Dispose();
         _audioCache?.Dispose();
+    }
+
+    private sealed record EditorCommand(string Name, Action Undo, Action Redo);
+
+    private sealed record EditorClipboardItem(
+        EditorClipboardKind Kind,
+        string Lane,
+        string Type,
+        string AudioId,
+        int? DurationTicks)
+    {
+        public static EditorClipboardItem FromNote(NoteRow note)
+        {
+            return new EditorClipboardItem(
+                EditorClipboardKind.Note,
+                note.Lane,
+                string.IsNullOrWhiteSpace(note.Type) ? "tap" : note.Type,
+                note.AudioId,
+                note.DurationTicks);
+        }
+
+        public static EditorClipboardItem FromBgm(BackgroundAudioEvent bgm)
+        {
+            return new EditorClipboardItem(
+                EditorClipboardKind.Bgm,
+                bgm.Lane ?? "background1",
+                "bgm",
+                bgm.AudioId,
+                null);
+        }
+    }
+
+    private enum EditorClipboardKind
+    {
+        Note,
+        Bgm
     }
 }

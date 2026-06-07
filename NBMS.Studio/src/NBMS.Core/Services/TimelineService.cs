@@ -38,7 +38,8 @@ public sealed class TimelineService
                 TimeSeconds = TickToSeconds(note.Tick, segments, stopDurations),
                 Kind = "Note",
                 Lane = note.Lane,
-                Detail = $"{note.Type} {note.AudioId}"
+                Detail = $"{note.Type} {note.AudioId}",
+                DurationTicks = note.DurationTicks
             });
         }
 
@@ -150,6 +151,7 @@ public sealed class TimelineService
             "bpm" => $"BPM {timing.Value}",
             "bar" => "Bar",
             "stop" => $"STOP {timing.DurationTicks} ticks",
+            "lnobj" => $"LNOBJ {timing.Event}",
             _ => timing.Type
         };
     }
