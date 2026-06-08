@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using NBMS.Core.Models;
 
@@ -61,9 +63,12 @@ public sealed partial class BmsImportService
         "background8"
     ];
 
-    public async Task<BmsImportResult> ImportAsync(string bmsPath, CancellationToken cancellationToken = default)
+    public async Task<BmsImportResult> ImportAsync(
+        string bmsPath,
+        string? encodingName = null,
+        CancellationToken cancellationToken = default)
     {
-        var lines = await File.ReadAllLinesAsync(bmsPath, cancellationToken);
+        var lines = await File.ReadAllLinesAsync(bmsPath, ResolveEncoding(encodingName), cancellationToken);
         var doc = new BmsImportDocument { SourcePath = bmsPath };
 
         foreach (var rawLine in lines)
@@ -81,7 +86,7 @@ public sealed partial class BmsImportService
                 {
                     Measure = int.Parse(channelMatch.Groups["measure"].Value, CultureInfo.InvariantCulture),
                     Channel = channelMatch.Groups["channel"].Value.ToUpperInvariant(),
-                    Data = channelMatch.Groups["data"].Value.Trim().ToUpperInvariant()
+                    Data = channelMatch.Groups["data"].Value.Trim()
                 });
                 continue;
             }
@@ -92,51 +97,79 @@ public sealed partial class BmsImportService
                 continue;
             }
 
-            ApplyHeaderLine(doc, headerMatch.Groups["key"].Value.ToUpperInvariant(), headerMatch.Groups["value"].Value.Trim());
+            ApplyHeaderLine(doc, headerMatch.Groups["key"].Value, headerMatch.Groups["value"].Value.Trim());
         }
 
         return BuildResult(doc);
     }
 
+    private static Encoding ResolveEncoding(string? encodingName)
+    {
+        if (string.IsNullOrWhiteSpace(encodingName) ||
+            encodingName.Equals("utf-8", StringComparison.OrdinalIgnoreCase))
+        {
+            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+        }
+
+        if (encodingName.Equals("system-default", StringComparison.OrdinalIgnoreCase))
+        {
+            return Encoding.Default;
+        }
+
+        try
+        {
+            return Encoding.GetEncoding(encodingName);
+        }
+        catch
+        {
+            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+        }
+    }
+
     private static void ApplyHeaderLine(BmsImportDocument doc, string key, string value)
     {
-        if (key == "TITLE")
+        var upperKey = key.ToUpperInvariant();
+        if (upperKey == "TITLE")
         {
             doc.Title = value;
         }
-        else if (key == "ARTIST")
+        else if (upperKey == "ARTIST")
         {
             doc.Artist = value;
         }
-        else if (key == "GENRE")
+        else if (upperKey == "GENRE")
         {
             doc.Genre = value;
         }
-        else if (key == "BPM" && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var bpm))
+        else if (upperKey == "BPM" && double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var bpm))
         {
             doc.Bpm = bpm;
         }
-        else if (key == "PLAYLEVEL" && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var level))
+        else if (upperKey == "PLAYLEVEL" && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var level))
         {
             doc.PlayLevel = level;
         }
-        else if (key == "LNOBJ" && value.Length >= 2)
+        else if (upperKey == "LNOBJ" && value.Length >= 2)
         {
-            doc.LnObj = value[..2].ToUpperInvariant();
+            doc.LnObj = value[..2];
         }
-        else if (key.StartsWith("WAV", StringComparison.Ordinal) && key.Length == 5)
+        else if (upperKey.StartsWith("WAV", StringComparison.Ordinal) && key.Length == 5)
         {
             doc.Wav[key[3..]] = value;
         }
-        else if (key.StartsWith("BPM", StringComparison.Ordinal) && key.Length == 5 &&
+        else if (upperKey.StartsWith("BPM", StringComparison.Ordinal) && key.Length == 5 &&
                  double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var indexedBpm))
         {
             doc.BpmDefinitions[key[3..]] = indexedBpm;
         }
-        else if (key.StartsWith("STOP", StringComparison.Ordinal) && key.Length == 6 &&
+        else if (upperKey.StartsWith("STOP", StringComparison.Ordinal) && key.Length == 6 &&
                  double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var stopValue))
         {
             doc.StopDefinitions[key[4..]] = stopValue;
+        }
+        else if (IsRandomDirective(upperKey))
+        {
+            doc.RandomDirectives.Add(string.IsNullOrWhiteSpace(value) ? key : $"{key} {value}");
         }
     }
 
@@ -150,7 +183,7 @@ public sealed partial class BmsImportService
         var longNoteStarts = new Dictionary<string, PendingLongNote>(StringComparer.Ordinal);
         var lnObjStarts = new Dictionary<string, PendingLongNote>(StringComparer.Ordinal);
 
-        AddBarLines(chart, measureStarts);
+        AddBarLines(chart, measureStarts, doc.MeasureLengths);
 
         foreach (var line in doc.ChannelLines.OrderBy(line => line.Measure).ThenBy(line => line.Channel, StringComparer.Ordinal))
         {
@@ -253,7 +286,24 @@ public sealed partial class BmsImportService
             chart.Timing.Add(new TimingEvent { Tick = 0, Type = "lnobj", Event = doc.LnObj });
         }
 
+        if (doc.RandomDirectives.Count > 0 || ResolveSourceFormat(doc) != "bms")
+        {
+            chart.Metadata = JsonSerializer.SerializeToElement(new
+            {
+                bmsCompat = new
+                {
+                    sourceFormat = ResolveSourceFormat(doc),
+                    randomDirectives = doc.RandomDirectives
+                }
+            });
+        }
+
         return chart;
+    }
+
+    private static bool IsRandomDirective(string upperKey)
+    {
+        return upperKey is "RANDOM" or "SETRANDOM" or "IF" or "ELSEIF" or "ELSE" or "ENDIF" or "ENDRANDOM";
     }
 
     private static void AddChannelEvent(
@@ -399,11 +449,46 @@ public sealed partial class BmsImportService
 
     private static string ResolveMode(BmsImportDocument doc)
     {
+        var sourceFormat = ResolveSourceFormat(doc);
+        if (sourceFormat == "pms")
+        {
+            return "pms-9k";
+        }
+
+        if (sourceFormat == "oct")
+        {
+            return "oct";
+        }
+
+        if (sourceFormat == "fp")
+        {
+            return "foot-pedal";
+        }
+
+        if (sourceFormat == "ibmsc")
+        {
+            return "ibmsc";
+        }
+
         return doc.ChannelLines.Any(line =>
             NoteChannels.TryGetValue(line.Channel, out var lane) && lane is "scratch2" or "key8" or "key9" or "key10" or "key11" or "key12" or "key13" or "key14" ||
             LongNoteChannels.TryGetValue(line.Channel, out var longLane) && longLane is "scratch2" or "key8" or "key9" or "key10" or "key11" or "key12" or "key13" or "key14")
             ? "beat-14k"
             : "beat-7k";
+    }
+
+    private static string ResolveSourceFormat(BmsImportDocument doc)
+    {
+        return Path.GetExtension(doc.SourcePath).ToLowerInvariant() switch
+        {
+            ".pms" => "pms",
+            ".oct" => "oct",
+            ".fp" => "fp",
+            ".bme" => "bme",
+            ".bml" => "bml",
+            ".ibmsc" => "ibmsc",
+            _ => "bms"
+        };
     }
 
     private static Dictionary<int, int> BuildMeasureStarts(BmsImportDocument doc)
@@ -429,11 +514,25 @@ public sealed partial class BmsImportService
         return measureStarts;
     }
 
-    private static void AddBarLines(NbmsChart chart, Dictionary<int, int> measureStarts)
+    private static void AddBarLines(
+        NbmsChart chart,
+        Dictionary<int, int> measureStarts,
+        IReadOnlyDictionary<int, double> measureLengths)
     {
         foreach (var pair in measureStarts.OrderBy(pair => pair.Key))
         {
             chart.Timing.Add(new TimingEvent { Tick = pair.Value, Type = "bar" });
+            if (measureLengths.TryGetValue(pair.Key, out var length))
+            {
+                chart.Timing.Add(new TimingEvent
+                {
+                    Tick = pair.Value,
+                    Type = "measureLength",
+                    Value = length,
+                    ExtensionId = "nbms.bmsCompat",
+                    Event = "measureLength"
+                });
+            }
         }
     }
 
@@ -517,7 +616,7 @@ public sealed partial class BmsImportService
 
     private static string CreateAudioId(string wavKey, string fileName)
     {
-        return $"wav_{wavKey.ToLowerInvariant()}_{Path.GetFileNameWithoutExtension(fileName)}";
+        return $"wav_{wavKey}_{Path.GetFileNameWithoutExtension(fileName)}";
     }
 
     [GeneratedRegex("^#(?<measure>[0-9]{3})(?<channel>[0-9A-Z]{2}):(?<data>.*)$", RegexOptions.IgnoreCase)]
@@ -544,6 +643,7 @@ internal sealed class BmsImportDocument
     public Dictionary<string, double> BpmDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> StopDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<int, double> MeasureLengths { get; } = [];
+    public List<string> RandomDirectives { get; } = [];
     public List<BmsChannelLine> ChannelLines { get; } = [];
 }
 

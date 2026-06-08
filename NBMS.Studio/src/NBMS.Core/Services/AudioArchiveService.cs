@@ -6,6 +6,8 @@ namespace NBMS.Core.Services;
 
 public sealed class AudioArchiveService
 {
+    private readonly HashService _hashService = new();
+
     public async Task<AudioManifest> ReadManifestAsync(string audioArchivePath, CancellationToken cancellationToken = default)
     {
         await using var stream = File.OpenRead(audioArchivePath);
@@ -24,5 +26,178 @@ public sealed class AudioArchiveService
         using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
         return archive.Entries.Select(entry => entry.FullName).OrderBy(name => name).ToList();
     }
-}
 
+    public async Task WriteManifestAsync(
+        string audioArchivePath,
+        AudioManifest manifest,
+        CancellationToken cancellationToken = default)
+    {
+        await using var stream = File.Open(audioArchivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false);
+        archive.GetEntry("manifest.json")?.Delete();
+        var manifestEntry = archive.CreateEntry("manifest.json", CompressionLevel.Optimal);
+        await using var manifestStream = manifestEntry.Open();
+        await JsonSerializer.SerializeAsync(
+            manifestStream,
+            manifest,
+            NbmsJson.SerializerOptions,
+            cancellationToken);
+        await manifestStream.WriteAsync("\n"u8.ToArray(), cancellationToken);
+    }
+
+    public async Task<AudioEntry> AddAudioFileAsync(
+        string audioArchivePath,
+        AudioManifest manifest,
+        string sourceFilePath,
+        string audioId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(sourceFilePath))
+        {
+            throw new FileNotFoundException("追加する音声ファイルが見つかりません。", sourceFilePath);
+        }
+
+        var normalizedAudioId = SanitizeAudioId(audioId);
+        if (string.IsNullOrWhiteSpace(normalizedAudioId))
+        {
+            normalizedAudioId = SanitizeAudioId(Path.GetFileNameWithoutExtension(sourceFilePath));
+        }
+
+        normalizedAudioId = EnsureUniqueAudioId(manifest, normalizedAudioId);
+        var archivePath = EnsureUniqueArchivePath(
+            audioArchivePath,
+            $"audio/{normalizedAudioId}{Path.GetExtension(sourceFilePath).ToLowerInvariant()}");
+
+        await using (var stream = File.Open(audioArchivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false))
+        {
+            var entry = archive.CreateEntry(archivePath, CompressionLevel.Optimal);
+            await using var entryStream = entry.Open();
+            await using var sourceStream = File.OpenRead(sourceFilePath);
+            await sourceStream.CopyToAsync(entryStream, cancellationToken);
+        }
+
+        var audioEntry = new AudioEntry
+        {
+            AudioId = normalizedAudioId,
+            Path = archivePath,
+            Codec = ResolveCodec(sourceFilePath),
+            Hash = await _hashService.ComputeFileSha256Async(sourceFilePath, cancellationToken)
+        };
+
+        manifest.Entries.Add(audioEntry);
+        RefreshCodecRequired(manifest);
+        await WriteManifestAsync(audioArchivePath, manifest, cancellationToken);
+        return audioEntry;
+    }
+
+    public async Task RemoveAudioEntriesAsync(
+        string audioArchivePath,
+        AudioManifest manifest,
+        IEnumerable<string> audioIds,
+        CancellationToken cancellationToken = default)
+    {
+        var idSet = audioIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToHashSet(StringComparer.Ordinal);
+        if (idSet.Count == 0)
+        {
+            return;
+        }
+
+        var removePaths = manifest.Entries
+            .Where(entry => idSet.Contains(entry.AudioId))
+            .Select(entry => entry.Path.Replace('\\', '/'))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        manifest.Entries = manifest.Entries
+            .Where(entry => !idSet.Contains(entry.AudioId))
+            .ToList();
+        RefreshCodecRequired(manifest);
+
+        await using (var stream = File.Open(audioArchivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false))
+        {
+            foreach (var path in removePaths)
+            {
+                archive.GetEntry(path)?.Delete();
+            }
+        }
+
+        await WriteManifestAsync(audioArchivePath, manifest, cancellationToken);
+    }
+
+    private string EnsureUniqueArchivePath(string audioArchivePath, string preferredPath)
+    {
+        var existing = File.Exists(audioArchivePath)
+            ? ListArchiveEntries(audioArchivePath).ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!existing.Contains(preferredPath))
+        {
+            return preferredPath;
+        }
+
+        var directory = Path.GetDirectoryName(preferredPath)?.Replace('\\', '/') ?? "audio";
+        var fileName = Path.GetFileNameWithoutExtension(preferredPath);
+        var extension = Path.GetExtension(preferredPath);
+        for (var index = 2; ; index++)
+        {
+            var candidate = $"{directory}/{fileName}_{index}{extension}";
+            if (!existing.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+
+    private static string EnsureUniqueAudioId(AudioManifest manifest, string preferredId)
+    {
+        var existing = manifest.Entries
+            .Select(entry => entry.AudioId)
+            .ToHashSet(StringComparer.Ordinal);
+        if (!existing.Contains(preferredId))
+        {
+            return preferredId;
+        }
+
+        for (var index = 2; ; index++)
+        {
+            var candidate = $"{preferredId}_{index}";
+            if (!existing.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+
+    private static string SanitizeAudioId(string value)
+    {
+        var chars = value
+            .Trim()
+            .Select(ch => char.IsLetterOrDigit(ch) || ch is '_' or '-' or '.' ? ch : '_')
+            .ToArray();
+        return new string(chars).Trim('_');
+    }
+
+    private static string ResolveCodec(string path)
+    {
+        return Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".wav" => "wav",
+            ".flac" => "flac",
+            ".ogg" or ".oga" => "ogg",
+            ".mp3" => "mp3",
+            _ => "unknown"
+        };
+    }
+
+    private static void RefreshCodecRequired(AudioManifest manifest)
+    {
+        manifest.CodecRequired = manifest.Entries
+            .Select(entry => entry.Codec)
+            .Where(codec => !string.IsNullOrWhiteSpace(codec) && codec != "unknown")
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(codec => codec, StringComparer.Ordinal)
+            .ToList();
+    }
+}

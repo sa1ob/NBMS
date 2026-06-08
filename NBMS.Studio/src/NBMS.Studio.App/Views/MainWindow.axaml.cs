@@ -1,3 +1,4 @@
+using System.Globalization;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
@@ -12,9 +13,12 @@ namespace NBMS.Studio.App.Views;
 
 public sealed partial class MainWindow : Window
 {
+    private const double EditorTimelinePixelsPerTick = 0.125;
+    private const double EditorTimelineBottomPadding = 12.0;
     private readonly MainWindowViewModel _viewModel = new();
     private PlaybackWindow? _playbackWindow;
     private bool _pendingScrollEditorTimelineToMeasureZero;
+    private int? _pendingEditorTimelineTargetTick;
     private int _editorTimelineScrollRequestId;
 
     public MainWindow()
@@ -22,6 +26,7 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         DataContext = _viewModel;
         EditorTimelineCanvas.TimelineHit += EditorTimelineCanvas_TimelineHit;
+        EditorTimelineCanvas.TimelineDragCompleted += EditorTimelineCanvas_TimelineDragCompleted;
         KeyDown += MainWindow_KeyDown;
     }
 
@@ -124,6 +129,14 @@ public sealed partial class MainWindow : Window
         QueueScrollEditorTimelineToMeasureZero();
     }
 
+    private void EventSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_viewModel.SelectedEventRow is { } row)
+        {
+            QueueScrollEditorTimelineToTick(row.Tick);
+        }
+    }
+
     private void EditorTimelineScrollViewer_Loaded(object? sender, RoutedEventArgs e)
     {
         QueueScrollEditorTimelineToMeasureZero();
@@ -138,7 +151,7 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void EditorTimelineCanvas_TimelineHit(object? sender, TimelineHitEventArgs e)
+    private async void EditorTimelineCanvas_TimelineHit(object? sender, TimelineHitEventArgs e)
     {
         _viewModel.SetEditorTimelineDraftFromHit(e.Tick, e.Lane);
         if (e.Button == TimelineHitButton.Right)
@@ -147,12 +160,32 @@ public sealed partial class MainWindow : Window
         }
         else if (e.ClickCount >= 2)
         {
+            if (_viewModel.IsTimingLane(e.Lane))
+            {
+                var input = await ShowTimingEventInputDialogAsync(e.Tick, e.Lane);
+                if (input is not null)
+                {
+                    _viewModel.AddTimelineTimingEventFromHit(e.Tick, e.Lane, input.Value, input.DurationTicks);
+                }
+
+                return;
+            }
+
             _viewModel.AddTimelineObjectFromHit(e.Tick, e.Lane);
         }
         else
         {
-            _viewModel.SelectTimelineObjectFromHit(e.Tick, e.Lane);
+            var audioId = _viewModel.SelectTimelineObjectFromHit(e.Tick, e.Lane);
+            if (!string.IsNullOrWhiteSpace(audioId))
+            {
+                await _viewModel.PreviewAudioIdAsync(audioId);
+            }
         }
+    }
+
+    private void EditorTimelineCanvas_TimelineDragCompleted(object? sender, TimelineDragEventArgs e)
+    {
+        _viewModel.MoveSelectedTimelineObject(e.FromTick, e.FromLane, e.ToTick, e.ToLane);
     }
 
     private void AddNote_Click(object? sender, RoutedEventArgs e)
@@ -168,6 +201,103 @@ public sealed partial class MainWindow : Window
     private void DeleteNote_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.DeleteSelectedNote();
+    }
+
+    private void SetLongNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.SetSelectedNoteLongNote();
+    }
+
+    private void ClearLongNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.ClearSelectedNoteLongNote();
+    }
+
+    private void SetChargeNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.SetSelectedNoteChargeNote();
+    }
+
+    private void SetHellChargeNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.SetSelectedNoteHellChargeNote();
+    }
+
+    private void SetMineNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.SetSelectedNoteMine();
+    }
+
+    private void SetInvisibleNote_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.SetSelectedNoteInvisible();
+    }
+
+    private void RepairSelectedMissingAudioReference_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.RepairSelectedMissingAudioReference();
+    }
+
+    private async void PreviewSelectedAudio_Click(object? sender, RoutedEventArgs e)
+    {
+        await _viewModel.PreviewSelectedAudioAsync();
+    }
+
+    private async void AddAudioAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        {
+            Title = "Add Audio Asset",
+            AllowMultiple = false,
+            FileTypeFilter =
+            [
+                new Avalonia.Platform.Storage.FilePickerFileType("Audio")
+                {
+                    Patterns = ["*.wav", "*.flac", "*.ogg", "*.oga", "*.mp3"]
+                }
+            ]
+        });
+
+        var filePath = files.FirstOrDefault()?.Path.LocalPath;
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return;
+        }
+
+        var defaultId = Path.GetFileNameWithoutExtension(filePath);
+        var audioId = await ShowAudioIdInputDialogAsync("Add Audio Asset", defaultId);
+        if (string.IsNullOrWhiteSpace(audioId))
+        {
+            return;
+        }
+
+        await RunUiTaskAsync(() => _viewModel.AddAudioAssetAsync(filePath, audioId));
+    }
+
+    private async void RenameAudioAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        if (_viewModel.SelectedAudioRow is null)
+        {
+            return;
+        }
+
+        var audioId = await ShowAudioIdInputDialogAsync("Rename AudioId", _viewModel.SelectedAudioRow.AudioId);
+        if (string.IsNullOrWhiteSpace(audioId))
+        {
+            return;
+        }
+
+        _viewModel.RenameSelectedAudioAsset(audioId);
+    }
+
+    private async void DeleteAudioAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.DeleteSelectedAudioAssetAsync);
+    }
+
+    private async void RemoveUnusedAudioAssets_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.RemoveUnusedAudioAssetsAsync);
     }
 
     private void Undo_Click(object? sender, RoutedEventArgs e)
@@ -312,6 +442,12 @@ public sealed partial class MainWindow : Window
             Text = preview.SuggestedTitle,
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
+        var encodingBox = new ComboBox
+        {
+            ItemsSource = new[] { "utf-8", "shift_jis", "system-default" },
+            SelectedIndex = 0,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
         var levelNameBoxes = new List<(string BmsPath, TextBox TextBox)>();
         var chartPanel = new StackPanel { Spacing = 8 };
 
@@ -380,7 +516,8 @@ public sealed partial class MainWindow : Window
                 levelNameBoxes.ToDictionary(
                     item => item.BmsPath,
                     item => item.TextBox.Text?.Trim() ?? "",
-                    StringComparer.OrdinalIgnoreCase));
+                    StringComparer.OrdinalIgnoreCase),
+                encodingBox.SelectedItem?.ToString() ?? "utf-8");
             dialog.Close();
         };
         cancelButton.Click += (_, _) => dialog.Close();
@@ -403,7 +540,9 @@ public sealed partial class MainWindow : Window
                     Children =
                     {
                         new TextBlock { Text = "Song title", FontWeight = FontWeight.SemiBold },
-                        titleBox
+                        titleBox,
+                        new TextBlock { Text = "BMS text encoding", FontWeight = FontWeight.SemiBold, Margin = new Avalonia.Thickness(0, 8, 0, 0) },
+                        encodingBox
                     }
                 }),
                 BuildDialogRow(2, new ScrollViewer
@@ -421,6 +560,162 @@ public sealed partial class MainWindow : Window
                 })
             }
         };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<TimingEventInput?> ShowTimingEventInputDialogAsync(int tick, string lane)
+    {
+        var isStop = string.Equals(lane, "stop", StringComparison.OrdinalIgnoreCase);
+        var defaultText = lane switch
+        {
+            "bpm" => string.IsNullOrWhiteSpace(_viewModel.BpmText) ? "120" : _viewModel.BpmText,
+            "stop" => _viewModel.EditorGridTicks.ToString(CultureInfo.InvariantCulture),
+            "measure" => "1.0",
+            "scroll" => "1.0",
+            "speed" => "1.0",
+            _ => "1.0"
+        };
+        var valueBox = new TextBox
+        {
+            Text = defaultText,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var messageText = new TextBlock
+        {
+            Text = isStop
+                ? "STOP duration ticksを入力してください。"
+                : lane.Equals("measure", StringComparison.OrdinalIgnoreCase)
+                    ? "小節長倍率を入力してください。通常の1小節は 1.0 です。"
+                    : $"{lane.ToUpperInvariant()} valueを入力してください。",
+            TextWrapping = TextWrapping.Wrap
+        };
+        var errorText = new TextBlock
+        {
+            Foreground = Brushes.Firebrick,
+            TextWrapping = TextWrapping.Wrap
+        };
+        TimingEventInput? result = null;
+        var okButton = new Button { Content = "Add", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        var dialog = new Window
+        {
+            Title = $"Add {lane.ToUpperInvariant()} Event",
+            Width = 420,
+            Height = 230,
+            MinWidth = 360,
+            MinHeight = 210
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            if (isStop)
+            {
+                if (!int.TryParse(valueBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var durationTicks) ||
+                    durationTicks <= 0)
+                {
+                    errorText.Text = "1以上の整数tickを入力してください。";
+                    return;
+                }
+
+                result = new TimingEventInput(null, durationTicks);
+                dialog.Close();
+                return;
+            }
+
+            if (!double.TryParse(valueBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            {
+                errorText.Text = "数値を入力してください。小数は . を使います。";
+                return;
+            }
+
+            if (lane.Equals("measure", StringComparison.OrdinalIgnoreCase) && value <= 0)
+            {
+                errorText.Text = "小節長倍率は0より大きい数値を入力してください。";
+                return;
+            }
+
+            result = new TimingEventInput(value, null);
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+
+        dialog.Content = new StackPanel
+        {
+            Margin = new Avalonia.Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = $"tick {tick} / lane {lane}",
+                    Foreground = Brushes.DimGray
+                },
+                messageText,
+                valueBox,
+                errorText,
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Spacing = 8,
+                    Children = { cancelButton, okButton }
+                }
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<string?> ShowAudioIdInputDialogAsync(string title, string defaultValue)
+    {
+        var textBox = new TextBox
+        {
+            Text = defaultValue,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var okButton = new Button { Content = "OK", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        string? result = null;
+        var dialog = new Window
+        {
+            Title = title,
+            Width = 420,
+            Height = 160,
+            MinWidth = 360,
+            MinHeight = 140,
+            Content = new Grid
+            {
+                Margin = new Avalonia.Thickness(16),
+                RowDefinitions = new RowDefinitions("Auto,*,Auto"),
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "AudioId",
+                        FontWeight = FontWeight.SemiBold
+                    },
+                    BuildDialogRow(1, textBox),
+                    BuildDialogRow(2, new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8,
+                        Margin = new Avalonia.Thickness(0, 12, 0, 0),
+                        Children = { cancelButton, okButton }
+                    })
+                }
+            }
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            result = textBox.Text?.Trim();
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
 
         await dialog.ShowDialog(this);
         return result;
@@ -446,6 +741,17 @@ public sealed partial class MainWindow : Window
 
     private void QueueScrollEditorTimelineToMeasureZero()
     {
+        _pendingEditorTimelineTargetTick = null;
+        var requestId = ++_editorTimelineScrollRequestId;
+        _pendingScrollEditorTimelineToMeasureZero = true;
+        Dispatcher.UIThread.Post(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Loaded);
+        Dispatcher.UIThread.Post(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Render);
+        _ = RetryScrollEditorTimelineToMeasureZeroAsync(requestId);
+    }
+
+    private void QueueScrollEditorTimelineToTick(int tick)
+    {
+        _pendingEditorTimelineTargetTick = tick;
         var requestId = ++_editorTimelineScrollRequestId;
         _pendingScrollEditorTimelineToMeasureZero = true;
         Dispatcher.UIThread.Post(() => ScrollEditorTimelineToMeasureZero(requestId), DispatcherPriority.Loaded);
@@ -475,13 +781,26 @@ public sealed partial class MainWindow : Window
             0,
             EditorTimelineScrollViewer.Extent.Height - EditorTimelineScrollViewer.Viewport.Height);
 
-        EditorTimelineScrollViewer.Offset = new Avalonia.Vector(EditorTimelineScrollViewer.Offset.X, maxOffsetY);
+        var offsetY = _pendingEditorTimelineTargetTick.HasValue
+            ? ResolveEditorTimelineOffsetForTick(_pendingEditorTimelineTargetTick.Value, maxOffsetY)
+            : maxOffsetY;
+        EditorTimelineScrollViewer.Offset = new Avalonia.Vector(EditorTimelineScrollViewer.Offset.X, offsetY);
         if (EditorTimelineScrollViewer.Extent.Height > 0 &&
             EditorTimelineScrollViewer.Viewport.Height > 0 &&
-            Math.Abs(EditorTimelineScrollViewer.Offset.Y - maxOffsetY) < 1)
+            Math.Abs(EditorTimelineScrollViewer.Offset.Y - offsetY) < 1)
         {
             _pendingScrollEditorTimelineToMeasureZero = false;
+            _pendingEditorTimelineTargetTick = null;
         }
+    }
+
+    private double ResolveEditorTimelineOffsetForTick(int tick, double maxOffsetY)
+    {
+        var canvasY = EditorTimelineCanvas.Bounds.Height -
+                      EditorTimelineBottomPadding -
+                      (tick - _viewModel.EditorTimelineStartTick) * EditorTimelinePixelsPerTick;
+        var targetOffset = canvasY - EditorTimelineScrollViewer.Viewport.Height * 0.55;
+        return Math.Clamp(targetOffset, 0, maxOffsetY);
     }
 
     private async Task ShowErrorAsync(string message)
@@ -515,4 +834,6 @@ public sealed partial class MainWindow : Window
 
         await dialog.ShowDialog(this);
     }
+
+    private sealed record TimingEventInput(double? Value, int? DurationTicks);
 }

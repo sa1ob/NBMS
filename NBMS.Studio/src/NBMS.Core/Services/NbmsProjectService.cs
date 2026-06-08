@@ -45,6 +45,11 @@ public sealed class NbmsProjectService
         }
 
         var audioPath = ResolveProjectPath(project, project.Header.Audio.File);
+        if (project.AudioManifest is not null)
+        {
+            await _audioArchiveService.WriteManifestAsync(audioPath, project.AudioManifest, cancellationToken);
+        }
+
         project.Header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
         await NbmsJson.WriteAsync(project.HeaderPath, project.Header, cancellationToken);
     }
@@ -125,4 +130,3 @@ public sealed class NbmsProjectService
         return registry;
     }
 }
-

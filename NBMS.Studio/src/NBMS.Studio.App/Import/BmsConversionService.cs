@@ -9,14 +9,14 @@ public sealed class BmsConversionService
 {
     private readonly BmsImportService _importService = new();
     private readonly HashService _hashService = new();
-    private static readonly string[] BmsPatterns = ["*.bms", "*.bme", "*.bml", "*.pms"];
+    private static readonly string[] BmsPatterns = ["*.bms", "*.bme", "*.bml", "*.pms", "*.oct", "*.fp", "*.ibmsc"];
 
     public async Task<BmsConversionResult> ConvertAsync(
         string bmsPath,
         string outputDirectory,
         CancellationToken cancellationToken = default)
     {
-        var importResult = await _importService.ImportAsync(bmsPath, cancellationToken);
+        var importResult = await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken);
         var outputRoot = Path.GetFullPath(outputDirectory);
         var scoreDirectory = Path.Combine(outputRoot, "score");
         Directory.CreateDirectory(scoreDirectory);
@@ -66,7 +66,7 @@ public sealed class BmsConversionService
         {
             importedFiles.Add(new ImportedBms(
                 bmsPath,
-                await _importService.ImportAsync(bmsPath, cancellationToken),
+                await _importService.ImportAsync(bmsPath, options?.EncodingName, cancellationToken),
                 new Dictionary<string, string>(StringComparer.Ordinal)));
         }
 
@@ -129,7 +129,7 @@ public sealed class BmsConversionService
         {
             importedFiles.Add(new ImportedBms(
                 bmsPath,
-                await _importService.ImportAsync(bmsPath, cancellationToken),
+                await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken),
                 new Dictionary<string, string>(StringComparer.Ordinal)));
         }
 
@@ -325,7 +325,7 @@ public sealed class BmsConversionService
 
     private static string CreateAudioId(string wavKey, string fileName)
     {
-        return $"wav_{wavKey.ToLowerInvariant()}_{Path.GetFileNameWithoutExtension(fileName)}";
+        return $"wav_{wavKey}_{Path.GetFileNameWithoutExtension(fileName)}";
     }
 
     private static string DetectCodec(string fileName)
@@ -500,7 +500,8 @@ public sealed record BmsFolderConversionResult(IReadOnlyList<BmsConversionResult
 
 public sealed record BmsFolderConversionOptions(
     string Title,
-    IReadOnlyDictionary<string, string> LevelNames);
+    IReadOnlyDictionary<string, string> LevelNames,
+    string EncodingName);
 
 public sealed record BmsFolderConversionPreview(
     string SourceDirectory,

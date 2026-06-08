@@ -28,6 +28,13 @@
         <MenuItem Header="選択ノーツへ反映" Click="ApplyNote_Click" IsEnabled= "False"/>
         <MenuItem Header="選択ノーツを削除" Click="DeleteNote_Click" IsEnabled = "False"/>
         <Separator />
+        <MenuItem Header="Set LN" Click="SetLongNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <MenuItem Header="Clear LN" Click="ClearLongNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <MenuItem Header="Set CN" Click="SetChargeNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <MenuItem Header="Set HCN" Click="SetHellChargeNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <MenuItem Header="Set Mine" Click="SetMineNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <MenuItem Header="Set Invisible" Click="SetInvisibleNote_Click" IsEnabled="{Binding CanEditSelectedNote}" />
+        <Separator />
         <MenuItem Header="Undo" Click="Undo_Click" IsEnabled="{Binding CanUndoEditorCommand}" />
         <MenuItem Header="Redo" Click="Redo_Click" IsEnabled="{Binding CanRedoEditorCommand}" />
         <Separator />
@@ -86,7 +93,7 @@
 
     <Grid RowDefinitions="*" ColumnDefinitions="270,*" Margin="8">
       <Border Grid.Row="0" Grid.Column="0" Background="#61796b5b" BorderBrush="#61b8a9af" BorderThickness="1" Padding="8">
-        <Grid RowDefinitions="Auto,Auto,*,Auto,*">
+        <Grid RowDefinitions="Auto,Auto,*">
           <StackPanel Grid.Row="0" Spacing="4" Margin="0,0,0,8">
             <TextBlock Text="プロジェクト" FontSize="16" FontWeight="SemiBold" />
             <TextBlock Text="{Binding ChartSummaryText}" Foreground="#f2f2f2" />
@@ -123,31 +130,59 @@
               </DataGrid>
             </TabItem>
             <TabItem Header="{Binding EventSummaryText}">
-              <DataGrid ItemsSource="{Binding Events}"
-                        AutoGenerateColumns="False"
-                        IsReadOnly="True">
-                <DataGrid.Columns>
-                  <DataGridTextColumn Header="Tick" Binding="{Binding Tick}" Width="64" />
-                  <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="54" />
-                  <DataGridTextColumn Header="Lane" Binding="{Binding Lane}" Width="68" />
-                  <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="*" />
-                </DataGrid.Columns>
-              </DataGrid>
+              <ListBox ItemsSource="{Binding Events}"
+                       SelectedItem="{Binding SelectedEventRow, Mode=TwoWay}"
+                       SelectionChanged="EventSelectionChanged"
+                       Background="White"
+                       Foreground="#111827" />
+            </TabItem>
+            <TabItem Header="{Binding IssueSummaryText}">
+              <Grid RowDefinitions="*,Auto">
+                <DataGrid Grid.Row="0"
+                          ItemsSource="{Binding Issues}"
+                          SelectedItem="{Binding SelectedIssueRow, Mode=TwoWay}"
+                          AutoGenerateColumns="False"
+                          IsReadOnly="True">
+                  <DataGrid.Columns>
+                    <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="62" />
+                    <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="72" />
+                    <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*" />
+                  </DataGrid.Columns>
+                </DataGrid>
+                <Button Grid.Row="1"
+                        Content="Fix with selected audio"
+                        Click="RepairSelectedMissingAudioReference_Click"
+                        IsEnabled="{Binding CanRepairMissingAudioReference}"
+                        Margin="0,6,0,0" />
+              </Grid>
+            </TabItem>
+            <TabItem Header="{Binding AudioSummaryText}">
+              <Grid RowDefinitions="*,Auto,Auto">
+                <ListBox Grid.Row="0"
+                         ItemsSource="{Binding AudioEntries}"
+                         SelectedItem="{Binding SelectedAudioRow, Mode=TwoWay}"
+                         Background="White"
+                         Foreground="#111827" />
+                <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
+                  <Button Content="Add" Click="AddAudioAsset_Click" Margin="0,0,4,4" />
+                  <Button Content="Rename" Click="RenameAudioAsset_Click" IsEnabled="{Binding CanEditSelectedAudio}" Margin="4,0,0,4" />
+                  <Button Content="Delete" Click="DeleteAudioAsset_Click" IsEnabled="{Binding CanEditSelectedAudio}" Margin="0,4,4,0" />
+                  <Button Content="Remove unused" Click="RemoveUnusedAudioAssets_Click" Margin="4,4,0,0" />
+                </UniformGrid>
+                <Button Grid.Row="2"
+                        Content="Preview selected audio"
+                        Click="PreviewSelectedAudio_Click"
+                        IsEnabled="{Binding CanPreviewSelectedAudio}"
+                        Margin="0,6,0,0" />
+              </Grid>
+            </TabItem>
+            <TabItem Header="{Binding MediaSummaryText}">
+              <ListBox ItemsSource="{Binding MediaEntries}"
+                       SelectedItem="{Binding SelectedMediaRow, Mode=TwoWay}"
+                       Background="White"
+                       Foreground="#111827" />
             </TabItem>
           </TabControl>
-
-          <TextBlock Grid.Row="3" Text="{Binding AudioSummaryText}" FontWeight="SemiBold" Margin="0,8,0,4" />
-
-          <DataGrid Grid.Row="4"
-                    ItemsSource="{Binding AudioEntries}"
-                    SelectedItem="{Binding SelectedAudioRow, Mode=TwoWay}"
-                    AutoGenerateColumns="False"
-                    IsReadOnly="True">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="AudioId" Binding="{Binding AudioId}" Width="*" />
-              <DataGridTextColumn Header="Codec" Binding="{Binding Codec}" Width="70" />
-            </DataGrid.Columns>
-          </DataGrid>
         </Grid>
       </Border>
 
@@ -171,6 +206,7 @@
                         VerticalScrollBarVisibility="Auto">
             <controls:TimelineCanvas x:Name="EditorTimelineCanvas"
                                      Items="{Binding Timeline}"
+                                     MeasureGridLines="{Binding MeasureGridLines}"
                                      PlayheadTick="0"
                                      StartTick="{Binding EditorTimelineStartTick}"
                                      GridTicks="{Binding EditorGridTicks}"

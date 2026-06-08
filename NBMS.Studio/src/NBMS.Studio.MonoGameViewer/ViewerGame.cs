@@ -412,7 +412,7 @@ public sealed class ViewerGame : Game
 
             var x = ResolveLaneX(left, note.LaneIndex, is14K);
             var noteColor = ResolveNoteColor(note.LaneIndex, is14K);
-            if (note.Type.Equals("hold", StringComparison.OrdinalIgnoreCase) && note.EndTimeSeconds > note.TimeSeconds)
+            if (note.EndTimeSeconds > note.TimeSeconds)
             {
                 DrawLongNote(x, y, endY, noteColor);
             }

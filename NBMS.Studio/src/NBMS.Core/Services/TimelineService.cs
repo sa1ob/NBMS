@@ -26,6 +26,7 @@ public sealed class TimelineService
                 Tick = timing.Tick,
                 TimeSeconds = TickToSeconds(timing.Tick, segments, stopDurations),
                 Kind = "Timing",
+                Lane = ResolveTimingLane(timing),
                 Detail = handled ? extensionDetail : DescribeCoreTiming(timing)
             });
         }
@@ -150,9 +151,24 @@ public sealed class TimelineService
         {
             "bpm" => $"BPM {timing.Value}",
             "bar" => "Bar",
+            "measureLength" => $"MEASURE {timing.Value ?? 1.0}",
             "stop" => $"STOP {timing.DurationTicks} ticks",
+            "speed" => $"SPEED {timing.Value ?? 1.0}",
             "lnobj" => $"LNOBJ {timing.Event}",
             _ => timing.Type
+        };
+    }
+
+    private static string ResolveTimingLane(TimingEvent timing)
+    {
+        return timing.Type switch
+        {
+            "bpm" => "bpm",
+            "stop" => "stop",
+            "measureLength" => "measure",
+            "scroll" => "scroll",
+            "speed" => "speed",
+            _ => ""
         };
     }
 
