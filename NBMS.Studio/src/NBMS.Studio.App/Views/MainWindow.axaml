@@ -177,10 +177,19 @@
               </Grid>
             </TabItem>
             <TabItem Header="{Binding MediaSummaryText}">
-              <ListBox ItemsSource="{Binding MediaEntries}"
-                       SelectedItem="{Binding SelectedMediaRow, Mode=TwoWay}"
-                       Background="White"
-                       Foreground="#111827" />
+              <Grid RowDefinitions="*,Auto">
+                <ListBox Grid.Row="0"
+                         ItemsSource="{Binding MediaAssetEntries}"
+                         SelectedItem="{Binding SelectedMediaAssetRow, Mode=TwoWay}"
+                         Background="White"
+                         Foreground="#111827" />
+                <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
+                  <Button Content="Add" Click="AddMediaAsset_Click" Margin="0,0,4,4" />
+                  <Button Content="Rename" Click="RenameMediaAsset_Click" IsEnabled="{Binding CanEditSelectedMediaAsset}" Margin="4,0,0,4" />
+                  <Button Content="Delete" Click="DeleteMediaAsset_Click" IsEnabled="{Binding CanEditSelectedMediaAsset}" Margin="0,4,4,0" />
+                  <Button Content="Remove unused" Click="RemoveUnusedMediaAssets_Click" Margin="4,4,0,0" />
+                </UniformGrid>
+              </Grid>
             </TabItem>
           </TabControl>
         </Grid>

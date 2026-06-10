@@ -80,6 +80,23 @@ public sealed class MediaRow
     }
 }
 
+public sealed class MediaAssetRow
+{
+    public string MediaId { get; set; } = "";
+    public string Type { get; set; } = "";
+    public string MimeType { get; set; } = "";
+    public string Path { get; set; } = "";
+    public int? Width { get; set; }
+    public int? Height { get; set; }
+    public int? DurationMs { get; set; }
+
+    public override string ToString()
+    {
+        var type = string.IsNullOrWhiteSpace(Type) ? "unknown" : Type;
+        return $"{MediaId} / {type} / {Path}";
+    }
+}
+
 public sealed class IssueRow
 {
     public string Severity { get; set; } = "";

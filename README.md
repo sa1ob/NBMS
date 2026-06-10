@@ -35,7 +35,8 @@ audio.nbma　・・・オーディオコンテナ
 score/
   main.nbmc　・・・譜面ファイル
 ```
-BGAも同様の形式に映像コンテナ/メディアコンテナとしてしまうことが考えられる（未実装）
+BGAも同様の形式に映像コンテナ/メディアコンテナ `.nbmg` として扱う実験実装を進めています。
+動画BGAの再生には、現時点では `ffmpeg` をインストールしてPATHから実行できる状態にしておく必要があります。
 
 
 ### メリット
@@ -55,6 +56,7 @@ BGAも同様の形式に映像コンテナ/メディアコンテナとしてし�
 ## 現在の状態
 - EditorアプリとViewerアプリのみ提供
 - 既存BMSから新フォーマットへの変換と再生のみ可能
+- 譜面ファイル `.nbmc` はJSONのままcompact-json layoutで保存する方針に移行中
 
 ### 使い方
 - [NBMS Studio Build手順](NBMS.Studio/docs/BUILD.md)をみてBuild必要  
@@ -121,7 +123,8 @@ score/
   main.nbmc ... chart file
 ```
 
-BGA could also be handled in a similar way as a video/media container, but this is not implemented yet.
+BGA is now being prototyped as a separate video/media container, `.nbmg`.
+Video BGA playback currently requires `ffmpeg` to be installed and available from PATH.
 
 ### Benefits
 
@@ -144,6 +147,7 @@ BGA could also be handled in a similar way as a video/media container, but this 
 
 - Only Editor and Viewer applications are provided.
 - Existing BMS files can be converted to the new format and played back.
+- Chart files `.nbmc` are being moved to a compact-json layout while remaining plain JSON.
 
 ### Usage
 

@@ -157,6 +157,26 @@ public sealed partial class BmsImportService
         {
             doc.Wav[key[3..]] = value;
         }
+        else if (upperKey.StartsWith("BMP", StringComparison.Ordinal) && key.Length == 5)
+        {
+            doc.Bmp[key[3..]] = value;
+        }
+        else if (upperKey.StartsWith("BGA", StringComparison.Ordinal) && key.Length == 5)
+        {
+            doc.BgaDefinitions[key[3..]] = value;
+        }
+        else if (upperKey == "STAGEFILE")
+        {
+            doc.StageFile = value;
+        }
+        else if (upperKey == "BANNER")
+        {
+            doc.Banner = value;
+        }
+        else if (upperKey == "BACKBMP")
+        {
+            doc.BackBmp = value;
+        }
         else if (upperKey.StartsWith("BPM", StringComparison.Ordinal) && key.Length == 5 &&
                  double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var indexedBpm))
         {
@@ -177,6 +197,8 @@ public sealed partial class BmsImportService
     {
         var measureStarts = BuildMeasureStarts(doc);
         var wavToAudioId = doc.Wav.ToDictionary(pair => pair.Key, pair => CreateAudioId(pair.Key, pair.Value), StringComparer.Ordinal);
+        var bmpToMediaId = doc.Bmp.ToDictionary(pair => pair.Key, pair => CreateMediaId("bmp", pair.Key, pair.Value), StringComparer.Ordinal);
+        var bgaToMediaId = BuildBgaMediaIdMap(doc, bmpToMediaId);
         var mode = ResolveMode(doc);
         var chart = CreateBaseChart(doc, mode);
         var backgroundLaneCountsByTick = new Dictionary<int, int>();
@@ -184,6 +206,7 @@ public sealed partial class BmsImportService
         var lnObjStarts = new Dictionary<string, PendingLongNote>(StringComparer.Ordinal);
 
         AddBarLines(chart, measureStarts, doc.MeasureLengths);
+        AddInitialMediaEvents(doc, chart);
 
         foreach (var line in doc.ChannelLines.OrderBy(line => line.Measure).ThenBy(line => line.Channel, StringComparer.Ordinal))
         {
@@ -207,7 +230,7 @@ public sealed partial class BmsImportService
                 }
 
                 var tick = ResolveTick(line.Measure, index, tokens.Count, measureStarts, doc.MeasureLengths);
-                AddChannelEvent(doc, chart, line.Channel, token, tick, wavToAudioId, backgroundLaneCountsByTick, longNoteStarts, lnObjStarts);
+                AddChannelEvent(doc, chart, line.Channel, token, tick, wavToAudioId, bmpToMediaId, bgaToMediaId, backgroundLaneCountsByTick, longNoteStarts, lnObjStarts);
             }
         }
 
@@ -264,7 +287,7 @@ public sealed partial class BmsImportService
             Security = new SecurityInfo { Signed = false, Encrypted = false, EditPolicy = "open" }
         };
 
-        return new BmsImportResult(header, chart, doc.Wav);
+        return new BmsImportResult(header, chart, doc.Wav, BuildMediaFiles(doc));
     }
 
     private static NbmsChart CreateBaseChart(BmsImportDocument doc, string mode)
@@ -313,6 +336,8 @@ public sealed partial class BmsImportService
         string token,
         int tick,
         IReadOnlyDictionary<string, string> wavToAudioId,
+        IReadOnlyDictionary<string, string> bmpToMediaId,
+        IReadOnlyDictionary<string, string> bgaToMediaId,
         Dictionary<int, int> backgroundLaneCountsByTick,
         Dictionary<string, PendingLongNote> longNoteStarts,
         Dictionary<string, PendingLongNote> lnObjStarts)
@@ -333,6 +358,17 @@ public sealed partial class BmsImportService
         else if (channel == "09" && doc.StopDefinitions.TryGetValue(token, out var stopValue))
         {
             chart.Timing.Add(new TimingEvent { Tick = tick, Type = "stop", DurationTicks = StopValueToTicks(stopValue) });
+        }
+        else if ((channel == "04" || channel == "07" || channel == "06") &&
+                 TryResolveMediaId(token, bmpToMediaId, bgaToMediaId, out var mediaId))
+        {
+            chart.MediaEvents.Add(new MediaEvent
+            {
+                Tick = tick,
+                MediaId = mediaId,
+                Type = channel == "06" ? "poor" : "image",
+                Layer = channel == "07" ? 1 : 0
+            });
         }
         else if (LongNoteChannels.TryGetValue(channel, out var longLane) && wavToAudioId.TryGetValue(token, out var longAudioId))
         {
@@ -409,6 +445,82 @@ public sealed partial class BmsImportService
         }
 
         chart.Notes.Add(new NoteEvent { Tick = tick, Lane = lane, Type = "tap", AudioId = audioId });
+    }
+
+    private static Dictionary<string, string> BuildBgaMediaIdMap(
+        BmsImportDocument doc,
+        IReadOnlyDictionary<string, string> bmpToMediaId)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in doc.BgaDefinitions)
+        {
+            var referencedBmpKey = pair.Value
+                .Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
+            if (referencedBmpKey is not null && bmpToMediaId.TryGetValue(referencedBmpKey, out var mediaId))
+            {
+                result[pair.Key] = mediaId;
+            }
+        }
+
+        return result;
+    }
+
+    private static bool TryResolveMediaId(
+        string token,
+        IReadOnlyDictionary<string, string> bmpToMediaId,
+        IReadOnlyDictionary<string, string> bgaToMediaId,
+        out string mediaId)
+    {
+        return bmpToMediaId.TryGetValue(token, out mediaId!) ||
+               bgaToMediaId.TryGetValue(token, out mediaId!);
+    }
+
+    private static void AddInitialMediaEvents(BmsImportDocument doc, NbmsChart chart)
+    {
+        if (!string.IsNullOrWhiteSpace(doc.BackBmp))
+        {
+            chart.MediaEvents.Add(new MediaEvent
+            {
+                Tick = 0,
+                MediaId = CreateMediaId("backbmp", "00", doc.BackBmp),
+                Type = "image",
+                Layer = 0
+            });
+        }
+
+        if (!string.IsNullOrWhiteSpace(doc.StageFile))
+        {
+            chart.MediaEvents.Add(new MediaEvent
+            {
+                Tick = 0,
+                MediaId = CreateMediaId("stagefile", "00", doc.StageFile),
+                Type = "stagefile",
+                Layer = 0
+            });
+        }
+    }
+
+    private static Dictionary<string, string> BuildMediaFiles(BmsImportDocument doc)
+    {
+        var mediaFiles = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in doc.Bmp)
+        {
+            mediaFiles[CreateMediaId("bmp", pair.Key, pair.Value)] = pair.Value;
+        }
+
+        AddHeaderMediaFile(mediaFiles, "stagefile", doc.StageFile);
+        AddHeaderMediaFile(mediaFiles, "banner", doc.Banner);
+        AddHeaderMediaFile(mediaFiles, "backbmp", doc.BackBmp);
+        return mediaFiles;
+    }
+
+    private static void AddHeaderMediaFile(Dictionary<string, string> mediaFiles, string kind, string? fileName)
+    {
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            mediaFiles[CreateMediaId(kind, "00", fileName)] = fileName;
+        }
     }
 
     private static List<LaneDefinition> CreateLanes(string mode)
@@ -619,6 +731,11 @@ public sealed partial class BmsImportService
         return $"wav_{wavKey}_{Path.GetFileNameWithoutExtension(fileName)}";
     }
 
+    private static string CreateMediaId(string kind, string key, string fileName)
+    {
+        return $"{kind}_{key}_{Path.GetFileNameWithoutExtension(fileName)}";
+    }
+
     [GeneratedRegex("^#(?<measure>[0-9]{3})(?<channel>[0-9A-Z]{2}):(?<data>.*)$", RegexOptions.IgnoreCase)]
     private static partial Regex ChannelLineRegex();
 
@@ -628,7 +745,11 @@ public sealed partial class BmsImportService
     private sealed record PendingLongNote(int Tick, string Lane, string AudioId);
 }
 
-public sealed record BmsImportResult(NbmsHeader Header, NbmsChart Chart, Dictionary<string, string> WavFiles);
+public sealed record BmsImportResult(
+    NbmsHeader Header,
+    NbmsChart Chart,
+    Dictionary<string, string> WavFiles,
+    Dictionary<string, string> MediaFiles);
 
 internal sealed class BmsImportDocument
 {
@@ -639,7 +760,12 @@ internal sealed class BmsImportDocument
     public double Bpm { get; set; } = 130;
     public int PlayLevel { get; set; }
     public string? LnObj { get; set; }
+    public string? StageFile { get; set; }
+    public string? Banner { get; set; }
+    public string? BackBmp { get; set; }
     public Dictionary<string, string> Wav { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Bmp { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> BgaDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> BpmDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> StopDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<int, double> MeasureLengths { get; } = [];

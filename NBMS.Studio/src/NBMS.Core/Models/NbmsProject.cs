@@ -7,6 +7,7 @@ public sealed class NbmsProject
     public NbmsHeader Header { get; set; } = new();
     public List<LoadedChart> Charts { get; set; } = [];
     public AudioManifest? AudioManifest { get; set; }
+    public MediaManifest? MediaManifest { get; set; }
     public List<ProjectIssue> Issues { get; set; } = [];
 }
 

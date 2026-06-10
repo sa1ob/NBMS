@@ -15,6 +15,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly TimelineService _timelineService;
     private readonly PackageService _packageService = new();
     private readonly AudioArchiveService _audioArchiveService = new();
+    private readonly MediaArchiveService _mediaArchiveService = new();
     private readonly BmsConversionService _bmsConversionService = new();
     private readonly ReferenceCheckService _referenceCheckService = new();
     private readonly DispatcherTimer _playbackTimer = new()
@@ -59,6 +60,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private NoteRow? _selectedNote;
     private AudioRow? _selectedAudioRow;
     private MediaRow? _selectedMediaRow;
+    private MediaAssetRow? _selectedMediaAssetRow;
     private IssueRow? _selectedIssueRow;
     private ChartRow? _selectedChartRow;
     private EventRow? _selectedEventRow;
@@ -101,6 +103,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public ObservableCollection<NoteRow> Notes { get; } = [];
     public ObservableCollection<AudioRow> AudioEntries { get; } = [];
     public ObservableCollection<MediaRow> MediaEntries { get; } = [];
+    public ObservableCollection<MediaAssetRow> MediaAssetEntries { get; } = [];
     public ObservableCollection<IssueRow> Issues { get; } = [];
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
     public ObservableCollection<MeasureGridLineRow> MeasureGridLines { get; } = [];
@@ -226,6 +229,25 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             }
         }
     }
+
+    public MediaAssetRow? SelectedMediaAssetRow
+    {
+        get => _selectedMediaAssetRow;
+        set
+        {
+            if (SetProperty(ref _selectedMediaAssetRow, value) && value is not null)
+            {
+                OnPropertyChanged(nameof(CanEditSelectedMediaAsset));
+                StatusText = $"Selected media asset: {value.MediaId}";
+            }
+            else
+            {
+                OnPropertyChanged(nameof(CanEditSelectedMediaAsset));
+            }
+        }
+    }
+
+    public bool CanEditSelectedMediaAsset => SelectedMediaAssetRow is not null;
 
     public bool CanRepairMissingAudioReference =>
         SelectedIssueRow is { Index: not null } issue &&
@@ -891,6 +913,116 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         await RemoveAudioAssetsAsync(unused, $"未使用音声を削除しました: {unused.Count}件");
     }
 
+    public async Task AddMediaAssetAsync(string sourceFilePath, string requestedMediaId, string mediaType)
+    {
+        if (_project is null)
+        {
+            StatusText = "NBMSを開いてからメディアを追加してください。";
+            return;
+        }
+
+        try
+        {
+            EnsureMediaManifest();
+            var mediaPath = ResolveMediaArchivePath(_project);
+            var entry = await _mediaArchiveService.AddMediaFileAsync(
+                mediaPath,
+                _project.MediaManifest!,
+                sourceFilePath,
+                requestedMediaId,
+                mediaType);
+            RefreshCollections();
+            SelectedMediaAssetRow = MediaAssetEntries.FirstOrDefault(row => row.MediaId == entry.MediaId);
+            StatusText = $"メディアを追加しました: {entry.MediaId}";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"メディア追加に失敗しました: {ex.Message}";
+        }
+    }
+
+    public void RenameSelectedMediaAsset(string newMediaId)
+    {
+        if (_project?.MediaManifest is null || SelectedMediaAssetRow is null)
+        {
+            StatusText = "リネームするメディアを選択してください。";
+            return;
+        }
+
+        var oldMediaId = SelectedMediaAssetRow.MediaId;
+        var normalizedNewId = NormalizeAssetId(newMediaId);
+        if (string.IsNullOrWhiteSpace(normalizedNewId) || string.Equals(oldMediaId, normalizedNewId, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (_project.MediaManifest.Entries.Any(entry => entry.MediaId == normalizedNewId))
+        {
+            StatusText = $"同じMediaIdがすでに存在します: {normalizedNewId}";
+            return;
+        }
+
+        var entryToRename = _project.MediaManifest.Entries.FirstOrDefault(entry => entry.MediaId == oldMediaId);
+        if (entryToRename is null)
+        {
+            StatusText = $"manifestにMediaIdが見つかりません: {oldMediaId}";
+            return;
+        }
+
+        entryToRename.MediaId = normalizedNewId;
+        foreach (var chart in _project.Charts)
+        {
+            foreach (var mediaEvent in chart.Chart.MediaEvents.Where(mediaEvent => mediaEvent.MediaId == oldMediaId))
+            {
+                mediaEvent.MediaId = normalizedNewId;
+            }
+        }
+
+        RefreshCollections();
+        SelectedMediaAssetRow = MediaAssetEntries.FirstOrDefault(row => row.MediaId == normalizedNewId);
+        StatusText = $"MediaIdを変更しました: {oldMediaId} -> {normalizedNewId}";
+    }
+
+    public async Task DeleteSelectedMediaAssetAsync()
+    {
+        if (_project?.MediaManifest is null || SelectedMediaAssetRow is null)
+        {
+            StatusText = "削除するメディアを選択してください。";
+            return;
+        }
+
+        var mediaId = SelectedMediaAssetRow.MediaId;
+        if (IsMediaReferenced(mediaId))
+        {
+            StatusText = $"参照中のメディアは削除できません: {mediaId}";
+            return;
+        }
+
+        await RemoveMediaAssetsAsync([mediaId], $"メディアを削除しました: {mediaId}");
+    }
+
+    public async Task RemoveUnusedMediaAssetsAsync()
+    {
+        if (_project?.MediaManifest is null)
+        {
+            StatusText = "media packがありません。";
+            return;
+        }
+
+        var referenced = ResolveReferencedMediaIds();
+        var unused = _project.MediaManifest.Entries
+            .Where(entry => !referenced.Contains(entry.MediaId))
+            .Select(entry => entry.MediaId)
+            .ToList();
+        if (unused.Count == 0)
+        {
+            StatusText = "未使用メディアはありません。";
+            return;
+        }
+
+        await RemoveMediaAssetsAsync(unused, $"未使用メディアを削除しました: {unused.Count}件");
+    }
+
     public string? SelectTimelineObjectFromHit(int tick, string lane)
     {
         if (_selectedChart is null)
@@ -1206,7 +1338,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     public string AudioSummaryText => $"{AudioEntries.Count} audio";
 
-    public string MediaSummaryText => $"{MediaEntries.Count} media";
+    public string MediaSummaryText => $"{MediaAssetEntries.Count} media";
 
     public string EventSummaryText => $"{Events.Count} events";
 
@@ -2593,9 +2725,51 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
     }
 
+    private async Task RemoveMediaAssetsAsync(IReadOnlyCollection<string> mediaIds, string successMessage)
+    {
+        if (_project?.MediaManifest is null || mediaIds.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await _mediaArchiveService.RemoveMediaEntriesAsync(
+                ResolveMediaArchivePath(_project),
+                _project.MediaManifest,
+                mediaIds);
+            RefreshCollections();
+            StatusText = successMessage;
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"メディア削除に失敗しました: {ex.Message}";
+        }
+    }
+
+    private void EnsureMediaManifest()
+    {
+        if (_project is null)
+        {
+            return;
+        }
+
+        _project.MediaManifest ??= new MediaManifest();
+        _project.Header.Media ??= new FileReference
+        {
+            File = "media.nbmg",
+            Optional = true
+        };
+    }
+
     private bool IsAudioReferenced(string audioId)
     {
         return ResolveReferencedAudioIds().Contains(audioId);
+    }
+
+    private bool IsMediaReferenced(string mediaId)
+    {
+        return ResolveReferencedMediaIds().Contains(mediaId);
     }
 
     private HashSet<string> ResolveReferencedAudioIds()
@@ -2613,6 +2787,19 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             .ToHashSet(StringComparer.Ordinal);
     }
 
+    private HashSet<string> ResolveReferencedMediaIds()
+    {
+        if (_project is null)
+        {
+            return [];
+        }
+
+        return _project.Charts
+            .SelectMany(chart => chart.Chart.MediaEvents.Select(mediaEvent => mediaEvent.MediaId))
+            .Where(mediaId => !string.IsNullOrWhiteSpace(mediaId))
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
     private static string ResolveAudioArchivePath(NbmsProject project)
     {
         return Path.GetFullPath(Path.Combine(
@@ -2620,7 +2807,25 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             project.Header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
     }
 
+    private static string ResolveMediaArchivePath(NbmsProject project)
+    {
+        var mediaFile = project.Header.Media?.File;
+        if (string.IsNullOrWhiteSpace(mediaFile))
+        {
+            mediaFile = "media.nbmg";
+        }
+
+        return Path.GetFullPath(Path.Combine(
+            project.RootDirectory,
+            mediaFile.Replace('/', Path.DirectorySeparatorChar)));
+    }
+
     private static string NormalizeAudioId(string value)
+    {
+        return NormalizeAssetId(value);
+    }
+
+    private static string NormalizeAssetId(string value)
     {
         var chars = value
             .Trim()
@@ -2671,6 +2876,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         Charts.Clear();
         AudioEntries.Clear();
         MediaEntries.Clear();
+        MediaAssetEntries.Clear();
         Issues.Clear();
         Events.Clear();
         Extensions.Clear();
@@ -2710,6 +2916,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         }
 
         RefreshMediaRows();
+        RefreshMediaAssetRows();
 
         foreach (var issue in _project.Issues)
         {
@@ -2762,6 +2969,29 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             foreach (var mediaEvent in _selectedChart.Chart.MediaEvents)
             {
                 MediaEntries.Add(MediaRow.FromMediaEvent(mediaEvent));
+            }
+        }
+
+        OnPropertyChanged(nameof(MediaSummaryText));
+    }
+
+    private void RefreshMediaAssetRows()
+    {
+        MediaAssetEntries.Clear();
+        if (_project?.MediaManifest is not null)
+        {
+            foreach (var entry in _project.MediaManifest.Entries)
+            {
+                MediaAssetEntries.Add(new MediaAssetRow
+                {
+                    MediaId = entry.MediaId,
+                    Type = entry.Type,
+                    MimeType = entry.MimeType,
+                    Path = entry.Path,
+                    Width = entry.Width,
+                    Height = entry.Height,
+                    DurationMs = entry.DurationMs
+                });
             }
         }
 

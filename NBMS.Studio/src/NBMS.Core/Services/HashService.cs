@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using NBMS.Core.Models;
 
 namespace NBMS.Core.Services;
 
@@ -15,7 +16,11 @@ public sealed class HashService
 
     public string ComputeCanonicalJsonHash<T>(T value)
     {
-        var canonical = Canonicalize(JsonSerializer.SerializeToElement(value, NbmsJson.SerializerOptions));
+        var canonical = value is NbmsChart chart
+            ? Canonicalize(JsonSerializer.SerializeToElement(
+                new CompactChartConverter().ToCompact(chart),
+                NbmsJson.CompactSerializerOptions))
+            : Canonicalize(JsonSerializer.SerializeToElement(value, NbmsJson.SerializerOptions));
         var bytes = Encoding.UTF8.GetBytes(canonical);
         return "sha256-" + Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
     }
@@ -38,4 +43,3 @@ public sealed class HashService
         };
     }
 }
-

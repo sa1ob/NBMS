@@ -8,6 +8,7 @@ NBMS Studioは、NBMSドラフトフォーマットを検証するための実�
 - .NET 8
 - Avalonia
 - MonoGame（Viewer描画ループ試作用）
+- ffmpeg（MonoGame Viewerの動画BGAデコード用。PATHから実行できる必要があります）
 
 ## ドキュメント
 
@@ -35,7 +36,9 @@ dotnet build .\NBMS.Studio\src\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameVi
 dotnet run --project .\NBMS.Studio\src\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameViewer.csproj -- path\to\song.nbmh --chart chart-id
 ```
 
-NBMS Studio本体からは、`外部ビューワ > MonoGame Viewerを開く` またはツールバーの `MonoGame` から起動できます。現時点では描画ループ検証用で、音声再生は未接続です。
+NBMS Studio本体からは、`外部ビューワ > MonoGame Viewerを開く` またはツールバーの `MonoGame` から起動できます。MonoGame Viewerは音声再生、譜面スクロール、画像BGA、動画BGAの試作再生に対応しています。
+
+動画BGAは `ffmpeg` を外部プロセスとして起動し、RGBAフレームをMonoGameのTextureに転送して描画します。`ffmpeg` がPATHにない場合、動画BGAは表示されません。
 
 StudioからMonoGame Viewerを起動する場合は、先にMonoGame Viewer projectをbuildしてください。build済みexeが見つかった場合は、Studioは`dotnet run`ではなくViewer exeを直接起動します。
 
@@ -51,6 +54,7 @@ It is built with:
 - .NET 8
 - Avalonia
 - MonoGame (prototype viewer render loop)
+- ffmpeg (used by MonoGame Viewer for video BGA decoding; it must be available from PATH)
 
 ## Documents
 
@@ -78,7 +82,8 @@ dotnet build .\NBMS.Studio\src\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameVi
 dotnet run --project .\NBMS.Studio\src\NBMS.Studio.MonoGameViewer\NBMS.Studio.MonoGameViewer.csproj -- path\to\song.nbmh --chart chart-id
 ```
 
-From NBMS Studio, use `External Viewer > Open MonoGame Viewer` or the `MonoGame` toolbar button. Audio playback is not connected yet.
+From NBMS Studio, use `External Viewer > Open MonoGame Viewer` or the `MonoGame` toolbar button. MonoGame Viewer currently supports prototype playback for audio, chart scrolling, image BGA, and video BGA.
+
+Video BGA uses `ffmpeg` as an external process and streams RGBA frames into a MonoGame Texture. If `ffmpeg` is not available from PATH, video BGA will not be displayed.
 
 When launching MonoGame Viewer from Studio, build the MonoGame Viewer project first. If the built executable is found, Studio launches the Viewer exe directly instead of using `dotnet run`.
-

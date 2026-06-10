@@ -62,7 +62,7 @@ score/
   "difficulty": 10,
   "levelName": "Hyper",
   "hash": "sha256-...",
-  "hashAlgorithm": "sha256-canonical-json"
+  "hashAlgorithm": "sha256-compact-canonical-json"
 }
 ```
 
@@ -85,6 +85,42 @@ score/
 - `backgroundAudio[]`
 - `mediaEvents[]`
 - `extensions[]`
+
+### Compact JSON layout
+
+draft 0.2以降の `.nbmc` は、JSONのまま `compact-json` layoutを標準保存形式とします。
+従来のobject配列形式はreadable-json互換形式として読み込み可能ですが、BMS変換後およびStudio保存後のscoreはcompact-jsonで保存します。
+
+compact-jsonでは、`dictionary` にlane/audio/media IDを集約し、配置情報はtuple配列で保存します。
+
+```json
+{
+  "format": "NBMS-CHART",
+  "version": "0.2.0",
+  "encoding": "compact-json",
+  "chartId": "main",
+  "mode": "beat-7k",
+  "resolution": 960,
+  "dictionary": {
+    "lanes": ["scratch", "key1", "key2"],
+    "audio": ["wav_01_kick", "wav_02_snare"],
+    "media": ["bmp_01_bga"]
+  },
+  "timing": [[0, "bpm", 180], [3840, "bar"]],
+  "notes": [[0, 1, 0, 0], [960, 2, 0, 1]],
+  "backgroundAudio": [[0, 0, 0]],
+  "mediaEvents": [[0, 0, "image", 0]]
+}
+```
+
+tuple定義:
+
+```text
+notes: [tick, laneIndex, typeIndex, audioIndex?, durationTicks?, volume?, pan?]
+backgroundAudio: [tick, audioIndex, backgroundLaneIndex?, volume?, pan?]
+mediaEvents: [tick, mediaIndex, type, layer?]
+timing: [tick, type, valueOrDuration?, extra?]
+```
 
 ## Timing
 
@@ -164,6 +200,51 @@ manifestは `audioId` と格納ファイル、codec metadataを対応付けま�
 
 安定版ではFLACを推奨必須codec候補としていますが、既存BMSパッケージを即時変換せず扱うため、prototypeではOGG Vorbisも許可しています。
 
+## メディアアーカイブ `.nbmg`
+
+物理形式: ZIP
+
+`.nbmg` は任意のメディアコンテナです。BGA、画像、動画、LAYER、POOR、BANNER、STAGEFILE などの視覚素材を `.nbma` とは分離して格納します。メディア素材が存在しない曲では省略できます。
+
+必須entry:
+
+```text
+manifest.json
+media/
+  asset files...
+```
+
+manifestは `mediaId` と格納ファイル、type metadataを対応付けます。
+
+```json
+{
+  "format": "NBMS-MEDIA",
+  "version": "0.1.0",
+  "entries": [
+    {
+      "mediaId": "bga_intro",
+      "path": "media/bga_intro.mp4",
+      "type": "video",
+      "mimeType": "video/mp4",
+      "hash": "sha256-..."
+    }
+  ]
+}
+```
+
+譜面側では `mediaEvents[]` から `mediaId` を参照します。
+
+```json
+{
+  "tick": 3840,
+  "mediaId": "bga_intro",
+  "type": "video",
+  "layer": 0
+}
+```
+
+NBMSでは、BMSの `#BMPxx` / `#BGAxx` / `#LAYER` / `#POOR` の2文字IDを内部の正規IDとして使い続けません。インポート時に安定した `mediaId` へ変換し、必要なら `nbms.bmsCompat` metadataに由来情報を保持します。
+
 ## パッケージ `.nbmp`
 
 物理形式: ZIP
@@ -182,13 +263,15 @@ score/
 
 ## Hash
 
-譜面hashにはcanonical JSONを使います。
+譜面hashにはcompact canonical JSONを使います。
 
 ```text
 sha256-canonical-json
 ```
 
-canonical化した譜面objectをUTF-8でエンコードし、SHA-256でhash化します。
+譜面を一度内部モデルへ読み込み、sort順、default値省略、null省略を固定したcompact-json正規形を生成します。
+そのcompact canonical JSONをUTF-8でエンコードし、SHA-256でhash化します。
+このため、readable-jsonとcompact-jsonで同じ譜面を表す場合は同一hashになります。
 
 関連: [../spec/hash_canonicalization.md](../spec/hash_canonicalization.md)
 
@@ -269,7 +352,7 @@ Each `charts[]` item references one `.nbmc` file:
   "difficulty": 10,
   "levelName": "Hyper",
   "hash": "sha256-...",
-  "hashAlgorithm": "sha256-canonical-json"
+  "hashAlgorithm": "sha256-compact-canonical-json"
 }
 ```
 
@@ -292,6 +375,42 @@ Core fields:
 - `backgroundAudio[]`
 - `mediaEvents[]`
 - `extensions[]`
+
+### Compact JSON Layout
+
+From draft 0.2 onward, `.nbmc` keeps JSON as the file format but uses `compact-json` as the standard saved layout.
+The older object-array layout remains readable as a compatibility/readable-json form, while converted BMS scores and Studio saves use compact-json.
+
+compact-json stores lane/audio/media IDs in `dictionary` and stores placement data as tuple arrays.
+
+```json
+{
+  "format": "NBMS-CHART",
+  "version": "0.2.0",
+  "encoding": "compact-json",
+  "chartId": "main",
+  "mode": "beat-7k",
+  "resolution": 960,
+  "dictionary": {
+    "lanes": ["scratch", "key1", "key2"],
+    "audio": ["wav_01_kick", "wav_02_snare"],
+    "media": ["bmp_01_bga"]
+  },
+  "timing": [[0, "bpm", 180], [3840, "bar"]],
+  "notes": [[0, 1, 0, 0], [960, 2, 0, 1]],
+  "backgroundAudio": [[0, 0, 0]],
+  "mediaEvents": [[0, 0, "image", 0]]
+}
+```
+
+Tuple definitions:
+
+```text
+notes: [tick, laneIndex, typeIndex, audioIndex?, durationTicks?, volume?, pan?]
+backgroundAudio: [tick, audioIndex, backgroundLaneIndex?, volume?, pan?]
+mediaEvents: [tick, mediaIndex, type, layer?]
+timing: [tick, type, valueOrDuration?, extra?]
+```
 
 ## Timing
 
@@ -371,6 +490,51 @@ Current prototype codec handling:
 
 FLAC remains the preferred required codec target for the future stable format, but the prototype allows OGG Vorbis to support existing BMS packages without immediate transcoding.
 
+## Media Archive `.nbmg`
+
+Physical format: ZIP
+
+`.nbmg` is an optional media container. It stores visual assets such as BGA, images, videos, LAYER, POOR, BANNER, and STAGEFILE separately from `.nbma`. Songs without media assets may omit it.
+
+Required entries:
+
+```text
+manifest.json
+media/
+  asset files...
+```
+
+The manifest maps `mediaId` values to archived files and type metadata.
+
+```json
+{
+  "format": "NBMS-MEDIA",
+  "version": "0.1.0",
+  "entries": [
+    {
+      "mediaId": "bga_intro",
+      "path": "media/bga_intro.mp4",
+      "type": "video",
+      "mimeType": "video/mp4",
+      "hash": "sha256-..."
+    }
+  ]
+}
+```
+
+Charts reference media assets from `mediaEvents[]`.
+
+```json
+{
+  "tick": 3840,
+  "mediaId": "bga_intro",
+  "type": "video",
+  "layer": 0
+}
+```
+
+NBMS does not keep BMS `#BMPxx` / `#BGAxx` / `#LAYER` / `#POOR` two-character IDs as canonical internal IDs. Importers should map them to stable `mediaId` values and preserve source information in `nbms.bmsCompat` metadata when needed.
+
 ## Package `.nbmp`
 
 Physical format: ZIP
@@ -389,13 +553,15 @@ score/
 
 ## Hashing
 
-Chart hashes use canonical JSON:
+Chart hashes use compact canonical JSON:
 
 ```text
-sha256-canonical-json
+sha256-compact-canonical-json
 ```
 
-The canonical chart object is encoded as UTF-8 and hashed with SHA-256.
+Players and tools first load a chart into the internal chart model, then generate a compact-json canonical form with stable sorting and fixed default/null omission rules.
+That compact canonical JSON is encoded as UTF-8 and hashed with SHA-256.
+Readable-json and compact-json representations of the same chart therefore produce the same hash.
 
 See also: [../spec/hash_canonicalization.md](../spec/hash_canonicalization.md)
 
@@ -409,4 +575,3 @@ The header contains security metadata:
 - edit policy
 
 Encryption and signing are still draft topics. The current public Editor/Viewer should support open projects first.
-

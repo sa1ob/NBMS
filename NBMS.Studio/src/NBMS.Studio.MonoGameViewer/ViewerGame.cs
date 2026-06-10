@@ -4,6 +4,7 @@ using Microsoft.Xna.Framework.Input;
 using NBMS.Core.Models;
 using NBMS.Core.Services;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Text.Json;
 using Color = Microsoft.Xna.Framework.Color;
 using Keys = Microsoft.Xna.Framework.Input.Keys;
@@ -31,8 +32,12 @@ public sealed class ViewerGame : Game
     private ViewerAudioBank? _audioBank;
     private ViewerAudioPlayer? _audioPlayer;
     private LoadedChart? _chart;
+    private MediaManifest? _mediaManifest;
+    private readonly Dictionary<string, Texture2D> _mediaTextures = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _mediaVideoFiles = new(StringComparer.Ordinal);
     private List<RenderNote> _notes = [];
     private List<AudioScheduleItem> _audioSchedule = [];
+    private List<MediaScheduleItem> _mediaSchedule = [];
     private List<double> _measureSeconds = [];
     private List<BpmMarker> _bpmMarkers = [];
     private List<string> _statusLines = [];
@@ -41,10 +46,17 @@ public sealed class ViewerGame : Game
     private KeyboardState _previousKeyboardState;
     private double _playbackSeconds;
     private int _nextAudioIndex;
+    private int _nextMediaIndex;
     private int _nextHitIndex;
     private int _combo;
     private float _hiSpeed = 1.5f;
     private bool _isLogVisible;
+    private BgaPlayfieldSide _bgaPlayfieldSide = BgaPlayfieldSide.OneP;
+    private Texture2D? _currentBgaTexture;
+    private string? _currentBgaVideoId;
+    private FfmpegVideoDecoder? _videoDecoder;
+    private Texture2D? _videoTexture;
+    private string? _mediaTempDirectory;
     private FpsLimitMode _fpsLimitMode = FpsLimitMode.Unlimited;
     private double _fpsSampleSeconds;
     private int _fpsSampleFrames;
@@ -74,6 +86,14 @@ public sealed class ViewerGame : Game
         {
             _audioPlayer?.Dispose();
             _audioBank?.Dispose();
+            foreach (var texture in _mediaTextures.Values)
+            {
+                texture.Dispose();
+            }
+
+            _videoDecoder?.Dispose();
+            _videoTexture?.Dispose();
+            DeleteMediaTempDirectory();
         }
 
         base.Dispose(disposing);
@@ -129,6 +149,14 @@ public sealed class ViewerGame : Game
             CycleFpsLimitMode();
         }
 
+        if (IsPressed(keyboard, Keys.D5))
+        {
+            _bgaPlayfieldSide = _bgaPlayfieldSide == BgaPlayfieldSide.OneP
+                ? BgaPlayfieldSide.TwoP
+                : BgaPlayfieldSide.OneP;
+            AddLog($"bga side {_bgaPlayfieldSide}");
+        }
+
         if (IsPressed(keyboard, Keys.D9))
         {
             _isLogVisible = !_isLogVisible;
@@ -140,6 +168,7 @@ public sealed class ViewerGame : Game
 
         _playbackSeconds = _playbackClock.Elapsed.TotalSeconds;
         QueueUpcomingAudioEvents();
+        ProcessDueMediaEvents();
         ProcessDueHitEvents();
         _previousKeyboardState = keyboard;
         base.Update(gameTime);
@@ -159,6 +188,7 @@ public sealed class ViewerGame : Game
         }
 
         _spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
+        DrawBgaBackground();
         DrawPlayfield();
         DrawStatusOverlay();
         DrawInfoPanels();
@@ -199,7 +229,7 @@ public sealed class ViewerGame : Game
             var chartPath = Path.GetFullPath(Path.Combine(
                 rootDirectory,
                 chartReference.File.Replace('/', Path.DirectorySeparatorChar)));
-            var chart = ReadJson<NbmsChart>(chartPath);
+            var chart = NbmsJson.ReadChart(chartPath);
             _chart = new LoadedChart
             {
                 Reference = chartReference,
@@ -208,7 +238,9 @@ public sealed class ViewerGame : Game
             };
 
             BuildRenderData(_chart.Chart);
+            ApplyPreferredWindowSize(_chart.Reference.Mode);
             LoadAudioBank(header, rootDirectory);
+            LoadMediaBank(header, rootDirectory, _chart.Chart);
             _statusText = $"{header.Title} / {_chart.Reference.Id} / {_chart.Reference.Mode}";
             _statusLines = BuildStatusLines(_statusText, _notes.Count, _measureSeconds.Count);
             AppendViewerLog($"LoadProject ok notes={_notes.Count} measures={_measureSeconds.Count}");
@@ -250,6 +282,7 @@ public sealed class ViewerGame : Game
                 .Concat(holdEndTicks)
                 .Concat(bpmEvents.Select(timing => timing.Tick))
                 .Concat(chart.BackgroundAudio.Select(item => item.Tick))
+                .Concat(chart.MediaEvents.Select(item => item.Tick))
                 .Concat(measureTicks));
 
         _notes = chart.Notes
@@ -284,6 +317,19 @@ public sealed class ViewerGame : Game
             .Concat(backgroundAudio)
             .OrderBy(item => item.TimeSeconds)
             .ThenBy(item => item.Tick)
+            .ToList();
+
+        _mediaSchedule = chart.MediaEvents
+            .Where(item => !string.IsNullOrWhiteSpace(item.MediaId))
+            .Select(item => new MediaScheduleItem(
+                secondsByTick[item.Tick],
+                item.Tick,
+                item.MediaId,
+                item.Type,
+                item.Layer ?? 0))
+            .OrderBy(item => item.TimeSeconds)
+            .ThenBy(item => item.Layer)
+            .ThenBy(item => item.MediaId, StringComparer.Ordinal)
             .ToList();
 
         _measureSeconds = [];
@@ -344,6 +390,42 @@ public sealed class ViewerGame : Game
         }
     }
 
+    private void ProcessDueMediaEvents()
+    {
+        while (_nextMediaIndex < _mediaSchedule.Count &&
+               _mediaSchedule[_nextMediaIndex].TimeSeconds <= _playbackSeconds)
+        {
+            var item = _mediaSchedule[_nextMediaIndex++];
+            if (item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase))
+            {
+                _currentBgaTexture = null;
+                _currentBgaVideoId = null;
+                StopVideoDecoder();
+                AddLog("bga clear");
+                continue;
+            }
+
+            if (_mediaVideoFiles.TryGetValue(item.MediaId, out var videoPath))
+            {
+                _currentBgaTexture = null;
+                _currentBgaVideoId = item.MediaId;
+                PlayVideo(videoPath);
+                AddLog($"bga video {item.MediaId}");
+            }
+            else if (_mediaTextures.TryGetValue(item.MediaId, out var texture))
+            {
+                _currentBgaTexture = texture;
+                _currentBgaVideoId = null;
+                StopVideoDecoder();
+                AddLog($"bga {item.MediaId}");
+            }
+            else
+            {
+                AddLog($"bga missing {item.MediaId}");
+            }
+        }
+    }
+
     private void ProcessDueHitEvents()
     {
         while (_nextHitIndex < _audioSchedule.Count &&
@@ -365,11 +447,11 @@ public sealed class ViewerGame : Game
         }
 
         var viewport = GraphicsDevice.Viewport.Bounds;
-        var mode = _chart?.Reference.Mode ?? "beat-7k";
-        var is14K = mode.Contains("14", StringComparison.OrdinalIgnoreCase);
-        var laneCount = is14K ? LaneCount14K : LaneCount7K;
-        var playfieldWidth = laneCount * LaneWidth + (is14K ? SideGap : 0);
-        var left = (viewport.Width - playfieldWidth) * 0.5f;
+        var layout = ResolvePlayfieldLayout(viewport);
+        var laneCount = layout.LaneCount;
+        var is14K = layout.IsDoublePlay;
+        var playfieldWidth = layout.Width;
+        var left = layout.Left;
         var top = 56f;
         var bottom = viewport.Height - 28f;
         var judgeY = bottom - JudgeLineOffset;
@@ -427,6 +509,146 @@ public sealed class ViewerGame : Game
         DrawRect(left, judgeY, playfieldWidth, 4, new Color(255, 48, 48));
     }
 
+    private void DrawBgaBackground()
+    {
+        if (_spriteBatch is null || (_currentBgaTexture is null && _currentBgaVideoId is null))
+        {
+            return;
+        }
+
+        var viewport = GraphicsDevice.Viewport.Bounds;
+        var layout = ResolvePlayfieldLayout(viewport);
+        var rects = ResolveBgaRects(viewport, layout);
+        var texture = ResolveCurrentBgaTexture();
+        if (texture is null)
+        {
+            return;
+        }
+
+        if (_currentBgaVideoId is not null)
+        {
+            DrawVideoStatus(rects[0]);
+        }
+
+        if (layout.IsDoublePlay)
+        {
+            foreach (var rect in rects)
+            {
+                DrawBgaTexture(texture, rect);
+            }
+
+            return;
+        }
+
+        DrawBgaTexture(texture, rects[0]);
+    }
+
+    private void DrawBgaTexture(Texture2D texture, Microsoft.Xna.Framework.Rectangle rect)
+    {
+        if (_spriteBatch is null)
+        {
+            return;
+        }
+
+        DrawRect(rect.X - 2, rect.Y - 2, rect.Width + 4, rect.Height + 4, new Color(18, 22, 30));
+        var fit = FitTexture(texture, rect);
+        _spriteBatch.Draw(texture, fit, Color.White);
+    }
+
+    private void LoadMediaBank(NbmsHeader header, string rootDirectory, NbmsChart chart)
+    {
+        if (header.Media is not { File.Length: > 0 } mediaReference)
+        {
+            AddLog("media none");
+            return;
+        }
+
+        try
+        {
+            var mediaPath = Path.GetFullPath(Path.Combine(
+                rootDirectory,
+                mediaReference.File.Replace('/', Path.DirectorySeparatorChar)));
+            if (!File.Exists(mediaPath))
+            {
+                AddLog($"media missing {mediaReference.File}");
+                return;
+            }
+
+            using var stream = File.OpenRead(mediaPath);
+            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            var manifestEntry = archive.GetEntry("manifest.json")
+                ?? throw new InvalidDataException("media manifest missing");
+            using (var manifestStream = manifestEntry.Open())
+            {
+                _mediaManifest = JsonSerializer.Deserialize<MediaManifest>(manifestStream, NbmsJson.SerializerOptions);
+            }
+
+            var referenced = chart.MediaEvents
+                .Select(item => item.MediaId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var entry in _mediaManifest?.Entries ?? [])
+            {
+                if (!referenced.Contains(entry.MediaId))
+                {
+                    continue;
+                }
+
+                if (!IsImageMedia(entry))
+                {
+                    if (IsVideoMedia(entry))
+                    {
+                        ExtractVideoMedia(archive, entry);
+                    }
+                    else
+                    {
+                        AddLog($"media unsupported {entry.MediaId} type={entry.Type} mime={entry.MimeType}");
+                    }
+
+                    continue;
+                }
+
+                var archiveEntry = archive.GetEntry(entry.Path.Replace('\\', '/'));
+                if (archiveEntry is null)
+                {
+                    AddLog($"media entry missing {entry.MediaId} {entry.Path}");
+                    continue;
+                }
+
+                using var entryStream = archiveEntry.Open();
+                _mediaTextures[entry.MediaId] = Texture2D.FromStream(GraphicsDevice, entryStream);
+            }
+
+            AddLog($"media ready image={_mediaTextures.Count} video={_mediaVideoFiles.Count}/{referenced.Count}");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"media failed {ex.GetType().Name}: {ex.Message}");
+            AppendViewerLog($"LoadMediaBank failed {ex}");
+        }
+    }
+
+    private void ExtractVideoMedia(ZipArchive archive, MediaAssetEntry entry)
+    {
+        var archiveEntry = archive.GetEntry(entry.Path.Replace('\\', '/'));
+        if (archiveEntry is null)
+        {
+            AddLog($"media entry missing {entry.MediaId} {entry.Path}");
+            return;
+        }
+
+        _mediaTempDirectory ??= CreateMediaTempDirectory();
+        var extension = Path.GetExtension(entry.Path);
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            extension = ".mp4";
+        }
+
+        var outputPath = Path.Combine(_mediaTempDirectory, $"{SanitizeFileName(entry.MediaId)}{extension}");
+        archiveEntry.ExtractToFile(outputPath, overwrite: true);
+        _mediaVideoFiles[entry.MediaId] = outputPath;
+    }
+
     private void DrawLongNote(float laneX, float startY, float endY, Color noteColor)
     {
         var x = laneX + 4;
@@ -471,21 +693,26 @@ public sealed class ViewerGame : Game
             return;
         }
 
-        DrawRect(12, 56, 300, 144, new Color(10, 14, 22, 220));
-        DrawText($"{_combo} COMBO / {_notes.Count} NOTES", 24, 68, 2f, new Color(255, 235, 110));
-        DrawText($"TIME {_playbackSeconds:0.000}", 24, 96, 2f, new Color(220, 230, 245));
-        DrawText($"BPM {ResolveCurrentBpm():0.##}", 24, 116, 2f, new Color(255, 190, 120));
-        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", 24, 136, 2f, new Color(180, 220, 255));
-        DrawText($"AUDIO {_nextAudioIndex}/{_audioSchedule.Count}", 24, 156, 2f, new Color(180, 220, 255));
+        var panelWidth = 300f;
+        var panelX = _bgaPlayfieldSide == BgaPlayfieldSide.OneP
+            ? Math.Max(12f, viewport.Width - panelWidth - 12f)
+            : 12f;
+        DrawRect(panelX, 56, panelWidth, 144, new Color(10, 14, 22, 220));
+        DrawText($"{_combo} COMBO / {_notes.Count} NOTES", panelX + 12, 68, 2f, new Color(255, 235, 110));
+        DrawText($"TIME {_playbackSeconds:0.000}", panelX + 12, 96, 2f, new Color(220, 230, 245));
+        DrawText($"BPM {ResolveCurrentBpm():0.##}", panelX + 12, 116, 2f, new Color(255, 190, 120));
+        DrawText($"FPS {_displayFps:0} {GetFpsModeLabel()}", panelX + 12, 136, 2f, new Color(180, 220, 255));
+        DrawText($"AUDIO {_nextAudioIndex}/{_audioSchedule.Count}", panelX + 12, 156, 2f, new Color(180, 220, 255));
 
         if (_isLogVisible)
         {
-            DrawRect(viewport.Width - 288, 56, 276, 150, new Color(10, 14, 22, 220));
-            DrawText("LOG", viewport.Width - 276, 68, 2f, new Color(180, 220, 255));
+            var logX = panelX <= 12f ? viewport.Width - 288f : 12f;
+            DrawRect(logX, 56, 276, 150, new Color(10, 14, 22, 220));
+            DrawText("LOG", logX + 12, 68, 2f, new Color(180, 220, 255));
             var y = 90f;
             foreach (var line in _logLines.TakeLast(5))
             {
-                DrawText(SanitizeForPixelFont(line), viewport.Width - 276, y, 1.5f, new Color(220, 230, 245));
+                DrawText(SanitizeForPixelFont(line), logX + 12, y, 1.5f, new Color(220, 230, 245));
                 y += 15f;
             }
         }
@@ -601,7 +828,232 @@ public sealed class ViewerGame : Game
     private bool IsCurrentChart14K()
     {
         var mode = _chart?.Reference.Mode ?? "beat-7k";
-        return mode.Contains("14", StringComparison.OrdinalIgnoreCase);
+        return IsDoublePlayMode(mode);
+    }
+
+    private void ApplyPreferredWindowSize(string mode)
+    {
+        if (IsDoublePlayMode(mode))
+        {
+            _graphics.PreferredBackBufferWidth = 1280;
+            _graphics.PreferredBackBufferHeight = 820;
+            _graphics.ApplyChanges();
+        }
+    }
+
+    private PlayfieldLayout ResolvePlayfieldLayout(Microsoft.Xna.Framework.Rectangle viewport)
+    {
+        var mode = _chart?.Reference.Mode ?? "beat-7k";
+        var isDoublePlay = IsDoublePlayMode(mode);
+        var laneCount = ResolveLaneCount(mode);
+        var playfieldWidth = laneCount * LaneWidth + (isDoublePlay ? SideGap : 0);
+        var left = isDoublePlay
+            ? (viewport.Width - playfieldWidth) * 0.5f
+            : _bgaPlayfieldSide == BgaPlayfieldSide.OneP
+                ? 28f
+                : viewport.Width - playfieldWidth - 28f;
+        return new PlayfieldLayout(left, playfieldWidth, laneCount, isDoublePlay);
+    }
+
+    private static int ResolveLaneCount(string mode)
+    {
+        if (mode.Contains("14", StringComparison.OrdinalIgnoreCase) ||
+            mode.Contains("10", StringComparison.OrdinalIgnoreCase))
+        {
+            return LaneCount14K;
+        }
+
+        return mode.Contains("5", StringComparison.OrdinalIgnoreCase) ? 6 : LaneCount7K;
+    }
+
+    private static bool IsDoublePlayMode(string mode)
+    {
+        return mode.Contains("14", StringComparison.OrdinalIgnoreCase) ||
+               mode.Contains("10", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsImageMedia(MediaAssetEntry entry)
+    {
+        if (entry.Type.Equals("image", StringComparison.OrdinalIgnoreCase) ||
+            entry.Type.Equals("layer", StringComparison.OrdinalIgnoreCase) ||
+            entry.Type.Equals("poor", StringComparison.OrdinalIgnoreCase) ||
+            entry.Type.Equals("banner", StringComparison.OrdinalIgnoreCase) ||
+            entry.Type.Equals("stagefile", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var extension = Path.GetExtension(entry.Path).ToLowerInvariant();
+        return extension is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".webp";
+    }
+
+    private static bool IsVideoMedia(MediaAssetEntry entry)
+    {
+        if (entry.Type.Equals("video", StringComparison.OrdinalIgnoreCase) ||
+            entry.MimeType.StartsWith("video/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var extension = Path.GetExtension(entry.Path).ToLowerInvariant();
+        return extension is ".mp4" or ".avi" or ".webm" or ".mov" or ".mkv" or ".wmv" or ".mpg" or ".mpeg";
+    }
+
+    private static Microsoft.Xna.Framework.Rectangle FitTexture(Texture2D texture, Microsoft.Xna.Framework.Rectangle bounds)
+    {
+        var scale = Math.Min(
+            bounds.Width / (float)Math.Max(1, texture.Width),
+            bounds.Height / (float)Math.Max(1, texture.Height));
+        var width = Math.Max(1, (int)Math.Round(texture.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(texture.Height * scale));
+        return new Microsoft.Xna.Framework.Rectangle(
+            bounds.X + (bounds.Width - width) / 2,
+            bounds.Y + (bounds.Height - height) / 2,
+            width,
+            height);
+    }
+
+    private List<Microsoft.Xna.Framework.Rectangle> ResolveBgaRects(
+        Microsoft.Xna.Framework.Rectangle viewport,
+        PlayfieldLayout layout)
+    {
+        if (layout.IsDoublePlay)
+        {
+            var width = Math.Max(160, (viewport.Width - (int)layout.Width - 48) / 2);
+            var height = Math.Max(120, (viewport.Height - 84) / 2);
+            var top = 56;
+            var bottom = viewport.Height - 28 - height;
+            var left = 12;
+            var right = viewport.Width - 12 - width;
+            return
+            [
+                new Microsoft.Xna.Framework.Rectangle(left, top, width, height),
+                new Microsoft.Xna.Framework.Rectangle(left, bottom, width, height),
+                new Microsoft.Xna.Framework.Rectangle(right, top, width, height),
+                new Microsoft.Xna.Framework.Rectangle(right, bottom, width, height)
+            ];
+        }
+
+        var bgaLeft = _bgaPlayfieldSide == BgaPlayfieldSide.OneP
+            ? (int)(layout.Left + layout.Width + 18)
+            : 12;
+        var bgaRight = _bgaPlayfieldSide == BgaPlayfieldSide.OneP
+            ? viewport.Width - 12
+            : (int)layout.Left - 18;
+        return
+        [
+            new Microsoft.Xna.Framework.Rectangle(
+                bgaLeft,
+                56,
+                Math.Max(1, bgaRight - bgaLeft),
+                viewport.Height - 84)
+        ];
+    }
+
+    private Texture2D? ResolveCurrentBgaTexture()
+    {
+        if (_currentBgaVideoId is null)
+        {
+            return _currentBgaTexture;
+        }
+
+        if (_videoDecoder is null)
+        {
+            return null;
+        }
+
+        var frame = _videoDecoder.TakeLatestFrame();
+        if (frame is not null)
+        {
+            if (_videoTexture is null ||
+                _videoTexture.Width != FfmpegVideoDecoder.OutputWidth ||
+                _videoTexture.Height != FfmpegVideoDecoder.OutputHeight)
+            {
+                _videoTexture?.Dispose();
+                _videoTexture = new Texture2D(
+                    GraphicsDevice,
+                    FfmpegVideoDecoder.OutputWidth,
+                    FfmpegVideoDecoder.OutputHeight,
+                    mipmap: false,
+                    SurfaceFormat.Color);
+            }
+
+            _videoTexture.SetData(frame);
+        }
+
+        return _videoTexture;
+    }
+
+    private void PlayVideo(string videoPath)
+    {
+        try
+        {
+            if (_videoDecoder is not null && _videoDecoder.SourcePath.Equals(videoPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            StopVideoDecoder();
+            _videoDecoder = FfmpegVideoDecoder.Start(videoPath);
+        }
+        catch (Exception ex)
+        {
+            _currentBgaVideoId = null;
+            AddLog($"video failed {ex.GetType().Name}: {ex.Message}");
+            AppendViewerLog($"PlayVideo failed {ex}");
+        }
+    }
+
+    private void StopVideoDecoder()
+    {
+        _videoDecoder?.Dispose();
+        _videoDecoder = null;
+    }
+
+    private void DrawVideoStatus(Microsoft.Xna.Framework.Rectangle rect)
+    {
+        if (_videoDecoder is null || _videoDecoder.IsRunning)
+        {
+            return;
+        }
+
+        DrawRect(rect.X + 8, rect.Y + 8, Math.Min(rect.Width - 16, 360), 34, new Color(10, 14, 22, 220));
+        DrawText("BGA VIDEO STOPPED / CHECK FFMPEG", rect.X + 18, rect.Y + 18, 1.5f, new Color(255, 190, 120));
+    }
+
+    private void AddVideoDecoderLog()
+    {
+        if (_videoDecoder?.LastError is { Length: > 0 } error)
+        {
+            AddLog($"video {error}");
+        }
+    }
+
+    private static string CreateMediaTempDirectory()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "NBMS.Studio.MonoGameViewer.Media", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        return tempDirectory;
+    }
+
+    private void DeleteMediaTempDirectory()
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(_mediaTempDirectory) && Directory.Exists(_mediaTempDirectory))
+            {
+                Directory.Delete(_mediaTempDirectory, recursive: true);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+        return new string(value.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
     }
 
     private void DrawRect(float x, float y, float width, float height, Color color)
@@ -693,7 +1145,7 @@ public sealed class ViewerGame : Game
         return
         [
             $"NBMS MONOGAME VIEWER  {SanitizeForPixelFont(status)}",
-            $"NOTES {noteCount}  MEASURES {measureCount}  1-4 HS  7 FPS  9 LOG  ESC EXIT"
+            $"NOTES {noteCount}  MEASURES {measureCount}  1-5 HS/BGA  7 FPS  9 LOG  ESC EXIT"
         ];
     }
 
@@ -787,6 +1239,10 @@ public sealed class ViewerGame : Game
 
     private sealed record BpmMarker(double TimeSeconds, double Bpm);
 
+    private sealed record MediaScheduleItem(double TimeSeconds, int Tick, string MediaId, string Type, int Layer);
+
+    private sealed record PlayfieldLayout(float Left, float Width, int LaneCount, bool IsDoublePlay);
+
     private static void AppendViewerLog(string message)
     {
         var logPath = Path.Combine(Path.GetTempPath(), "NBMS.Studio.MonoGameViewer.log");
@@ -824,6 +1280,12 @@ public sealed class ViewerGame : Game
     }
 
     private sealed record AudioScheduleItem(double TimeSeconds, int Tick, string Lane, string AudioId, bool IsObject);
+
+    private enum BgaPlayfieldSide
+    {
+        OneP,
+        TwoP
+    }
 
     private enum FpsLimitMode
     {

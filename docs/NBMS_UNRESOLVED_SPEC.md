@@ -61,7 +61,7 @@ NBMSにはrights metadataがありますが、運用ポリシーは未確定で�
 
 ## ハッシュとランキング
 
-現在の譜面ハッシュはcanonical JSONを使います。
+現在の譜面ハッシュはcompact canonical JSONを使います。
 
 未決定事項:
 
@@ -77,13 +77,13 @@ NBMSにはrights metadataがありますが、運用ポリシーは未確定で�
 - `.nbmp` のインストール動作
 - パッケージ署名
 - パッケージ単位の依存関係
-- メディアパッケージ `.nbmg` の最終構造
+- メディアパッケージ `.nbmg` の詳細運用。draft 0.1ではZIP + `manifest.json` + `media/` を初期仕様とするが、プレビュー、動画codec必須範囲、BMS BGA変換方針は未確定。
 
 ## Editor動作
 
 未決定事項:
 
-- 保存時に元のJSON整形を保持するか
+- 保存時の標準形式はcompact-jsonに寄せる。元のJSON整形保持は開発用・互換用オプションとして扱うか未決定。
 - autosave / backup rules
 - Undo / Redo
 - 未対応拡張を含む譜面の編集モード
@@ -152,7 +152,7 @@ Open topics:
 
 ## Hash and Ranking Rules
 
-Current chart hash rules use canonical JSON.
+Current chart hash rules use compact canonical JSON.
 
 Open topics:
 
@@ -168,13 +168,13 @@ Open topics:
 - `.nbmp` installer behavior.
 - package signing.
 - package-level dependency references.
-- media package `.nbmg` final container structure.
+- Detailed operation of media package `.nbmg`. Draft 0.1 now defines the initial ZIP + `manifest.json` + `media/` structure, but preview behavior, required video codec scope, and BMS BGA conversion policy remain open.
 
 ## Editor Behavior
 
 Open topics:
 
-- whether editor saves should preserve original formatting.
+- standard saves now prefer compact-json. Whether preserving original formatting should remain as a development/compatibility option is unresolved.
 - autosave and backup file rules.
 - undo/redo expectations.
 - how to handle unsupported extensions in editing mode.

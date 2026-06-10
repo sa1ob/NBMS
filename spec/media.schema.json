@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/nbms/0.1/media.schema.json",
+  "title": "NBMS Media Manifest",
+  "description": "JSON Schema for manifest.json inside NBMS .nbmg media archives.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "version",
+    "entries"
+  ],
+  "properties": {
+    "format": {
+      "const": "NBMS-MEDIA"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^0\\.1\\.\\d+$"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mediaId",
+          "path",
+          "type",
+          "hash"
+        ],
+        "properties": {
+          "mediaId": {
+            "$ref": "#/$defs/mediaId"
+          },
+          "path": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "layer",
+              "poor",
+              "banner",
+              "stagefile",
+              "other"
+            ]
+          },
+          "mimeType": {
+            "type": "string"
+          },
+          "hash": {
+            "$ref": "#/$defs/sha256Hash"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "durationMs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rightsId": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "mediaId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "^(?:[a-zA-Z]:|/|\\\\|.*\\.\\.)"
+      }
+    },
+    "sha256Hash": {
+      "type": "string",
+      "pattern": "^sha256-[a-f0-9]{64}$"
+    }
+  }
+}

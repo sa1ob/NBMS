@@ -172,6 +172,9 @@
               "image",
               "video",
               "layer",
+              "poor",
+              "banner",
+              "stagefile",
               "clear"
             ]
           },

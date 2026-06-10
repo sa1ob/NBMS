@@ -6,6 +6,7 @@ Files:
 
 - `header.schema.json`: JSON Schema for `.nbmh` header files.
 - `chart.schema.json`: JSON Schema for `.nbmc` chart files.
+- `compact_chart.schema.json`: JSON Schema draft for compact-json `.nbmc` chart files.
 - `audio_container.md`: MVP container specification for `.nbma` audio archives.
 - `hash_canonicalization.md`: Environment-independent chart hash rules.
 - `package_container.md`: MVP distribution package specification for `.nbmp`.
@@ -22,6 +23,7 @@ Phase 1 intentionally avoids encryption and signing implementation details. Thos
 
 - `header.schema.json`: `.nbmh` ヘッダーファイル用JSON Schema
 - `chart.schema.json`: `.nbmc` 譜面ファイル用JSON Schema
+- `compact_chart.schema.json`: compact-json `.nbmc` 譜面ファイル用JSON Schemaドラフト
 - `audio_container.md`: `.nbma` 音源アーカイブのMVP仕様
 - `hash_canonicalization.md`: 環境依存しない譜面hash規則
 - `package_container.md`: `.nbmp` 配布パッケージMVP仕様

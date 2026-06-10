@@ -300,6 +300,63 @@ public sealed partial class MainWindow : Window
         await RunUiTaskAsync(_viewModel.RemoveUnusedAudioAssetsAsync);
     }
 
+    private async void AddMediaAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        {
+            Title = "Add Media Asset",
+            AllowMultiple = false,
+            FileTypeFilter =
+            [
+                new Avalonia.Platform.Storage.FilePickerFileType("Media")
+                {
+                    Patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif", "*.webp", "*.mp4", "*.webm", "*.avi", "*.mov", "*.mkv"]
+                }
+            ]
+        });
+
+        var filePath = files.FirstOrDefault()?.Path.LocalPath;
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return;
+        }
+
+        var defaultId = Path.GetFileNameWithoutExtension(filePath);
+        var mediaId = await ShowAudioIdInputDialogAsync("Add Media Asset", defaultId);
+        if (string.IsNullOrWhiteSpace(mediaId))
+        {
+            return;
+        }
+
+        await RunUiTaskAsync(() => _viewModel.AddMediaAssetAsync(filePath, mediaId, ""));
+    }
+
+    private async void RenameMediaAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        if (_viewModel.SelectedMediaAssetRow is null)
+        {
+            return;
+        }
+
+        var mediaId = await ShowAudioIdInputDialogAsync("Rename MediaId", _viewModel.SelectedMediaAssetRow.MediaId);
+        if (string.IsNullOrWhiteSpace(mediaId))
+        {
+            return;
+        }
+
+        _viewModel.RenameSelectedMediaAsset(mediaId);
+    }
+
+    private async void DeleteMediaAsset_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.DeleteSelectedMediaAssetAsync);
+    }
+
+    private async void RemoveUnusedMediaAssets_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.RemoveUnusedMediaAssetsAsync);
+    }
+
     private void Undo_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.UndoEditorCommand();
@@ -448,6 +505,12 @@ public sealed partial class MainWindow : Window
             SelectedIndex = 0,
             HorizontalAlignment = HorizontalAlignment.Stretch
         };
+        var readableScoreJsonBox = new CheckBox
+        {
+            Content = "Readable score JSON (indent compact-json)",
+            IsChecked = false,
+            Margin = new Avalonia.Thickness(0, 8, 0, 0)
+        };
         var levelNameBoxes = new List<(string BmsPath, TextBox TextBox)>();
         var chartPanel = new StackPanel { Spacing = 8 };
 
@@ -517,7 +580,8 @@ public sealed partial class MainWindow : Window
                     item => item.BmsPath,
                     item => item.TextBox.Text?.Trim() ?? "",
                     StringComparer.OrdinalIgnoreCase),
-                encodingBox.SelectedItem?.ToString() ?? "utf-8");
+                encodingBox.SelectedItem?.ToString() ?? "utf-8",
+                readableScoreJsonBox.IsChecked == true);
             dialog.Close();
         };
         cancelButton.Click += (_, _) => dialog.Close();
@@ -542,7 +606,8 @@ public sealed partial class MainWindow : Window
                         new TextBlock { Text = "Song title", FontWeight = FontWeight.SemiBold },
                         titleBox,
                         new TextBlock { Text = "BMS text encoding", FontWeight = FontWeight.SemiBold, Margin = new Avalonia.Thickness(0, 8, 0, 0) },
-                        encodingBox
+                        encodingBox,
+                        readableScoreJsonBox
                     }
                 }),
                 BuildDialogRow(2, new ScrollViewer

@@ -14,6 +14,7 @@ public sealed class BmsConversionService
     public async Task<BmsConversionResult> ConvertAsync(
         string bmsPath,
         string outputDirectory,
+        BmsConversionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
         var importResult = await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken);
@@ -23,19 +24,32 @@ public sealed class BmsConversionService
 
         var chartPath = Path.Combine(scoreDirectory, "main.nbmc");
         var audioPath = Path.Combine(outputRoot, "audio.nbma");
+        var mediaPath = Path.Combine(outputRoot, "media.nbmg");
         var headerPath = Path.Combine(outputRoot, "song.nbmh");
 
         importResult.Header.Audio.File = "audio.nbma";
         importResult.Header.Charts[0].File = "score/main.nbmc";
 
-        var imported = new ImportedBms(bmsPath, importResult, new Dictionary<string, string>(StringComparer.Ordinal));
+        var imported = new ImportedBms(
+            bmsPath,
+            importResult,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            new Dictionary<string, string>(StringComparer.Ordinal));
         var audioSources = BuildMergedAudioSources([imported]);
+        var mediaSources = BuildMergedMediaSources([imported]);
         RemapChartAudioIds(importResult.Chart, imported.AudioIdMap);
-        await NbmsJson.WriteAsync(chartPath, importResult.Chart, cancellationToken);
+        RemapChartMediaIds(importResult.Chart, imported.MediaIdMap);
+        await WriteChartAsync(chartPath, importResult.Chart, options?.ReadableScoreJson == true, cancellationToken);
         await CreateAudioArchiveAsync(audioSources, audioPath, cancellationToken);
+        if (mediaSources.Count > 0)
+        {
+            importResult.Header.Media = new FileReference { File = "media.nbmg", Optional = true };
+            await CreateMediaArchiveAsync(mediaSources, mediaPath, cancellationToken);
+            importResult.Header.Media.Hash = await _hashService.ComputeFileSha256Async(mediaPath, cancellationToken);
+        }
 
         importResult.Header.Charts[0].Hash = _hashService.ComputeCanonicalJsonHash(importResult.Chart);
-        importResult.Header.Charts[0].HashAlgorithm = "sha256-canonical-json";
+        importResult.Header.Charts[0].HashAlgorithm = "sha256-compact-canonical-json";
         importResult.Header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
         await NbmsJson.WriteAsync(headerPath, importResult.Header, cancellationToken);
 
@@ -67,18 +81,26 @@ public sealed class BmsConversionService
             importedFiles.Add(new ImportedBms(
                 bmsPath,
                 await _importService.ImportAsync(bmsPath, options?.EncodingName, cancellationToken),
+                new Dictionary<string, string>(StringComparer.Ordinal),
                 new Dictionary<string, string>(StringComparer.Ordinal)));
         }
 
         var header = BuildMergedHeader(sourceRoot, importedFiles);
         ApplyFolderConversionOptions(header, options);
         var audioPath = Path.Combine(outputRoot, "audio.nbma");
+        var mediaPath = Path.Combine(outputRoot, "media.nbmg");
         var headerPath = Path.Combine(outputRoot, "song.nbmh");
         var audioSources = BuildMergedAudioSources(importedFiles);
+        var mediaSources = BuildMergedMediaSources(importedFiles);
         var results = new List<BmsConversionResult>();
         var usedChartFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         await CreateAudioArchiveAsync(audioSources, audioPath, cancellationToken);
+        if (mediaSources.Count > 0)
+        {
+            header.Media = new FileReference { File = "media.nbmg", Optional = true };
+            await CreateMediaArchiveAsync(mediaSources, mediaPath, cancellationToken);
+        }
 
         foreach (var imported in importedFiles)
         {
@@ -89,7 +111,8 @@ public sealed class BmsConversionService
 
             imported.ImportResult.Chart.ChartId = chartId;
             RemapChartAudioIds(imported.ImportResult.Chart, imported.AudioIdMap);
-            await NbmsJson.WriteAsync(chartPath, imported.ImportResult.Chart, cancellationToken);
+            RemapChartMediaIds(imported.ImportResult.Chart, imported.MediaIdMap);
+            await WriteChartAsync(chartPath, imported.ImportResult.Chart, options?.ReadableScoreJson == true, cancellationToken);
 
             var sourceReference = imported.ImportResult.Header.Charts.FirstOrDefault() ?? new ChartReference();
             header.Charts.Add(new ChartReference
@@ -100,13 +123,17 @@ public sealed class BmsConversionService
                 Difficulty = sourceReference.Difficulty,
                 LevelName = ResolveLevelName(imported.BmsPath, sourceReference, options),
                 Hash = _hashService.ComputeCanonicalJsonHash(imported.ImportResult.Chart),
-                HashAlgorithm = "sha256-canonical-json"
+                HashAlgorithm = "sha256-compact-canonical-json"
             });
 
             results.Add(new BmsConversionResult(headerPath, chartPath, audioPath));
         }
 
         header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
+        if (header.Media is not null && File.Exists(mediaPath))
+        {
+            header.Media.Hash = await _hashService.ComputeFileSha256Async(mediaPath, cancellationToken);
+        }
         await NbmsJson.WriteAsync(headerPath, header, cancellationToken);
 
         return new BmsFolderConversionResult(results);
@@ -130,6 +157,7 @@ public sealed class BmsConversionService
             importedFiles.Add(new ImportedBms(
                 bmsPath,
                 await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken),
+                new Dictionary<string, string>(StringComparer.Ordinal),
                 new Dictionary<string, string>(StringComparer.Ordinal)));
         }
 
@@ -172,7 +200,7 @@ public sealed class BmsConversionService
             Bpm = firstHeader.Bpm,
             Preview = firstHeader.Preview,
             Audio = new FileReference { File = "audio.nbma" },
-            Media = firstHeader.Media,
+            Media = null,
             Charts = [],
             Rights = firstHeader.Rights,
             Security = new SecurityInfo { Signed = false, Encrypted = false, EditPolicy = "open" },
@@ -236,6 +264,35 @@ public sealed class BmsConversionService
         return candidate;
     }
 
+    private static List<MediaSource> BuildMergedMediaSources(IReadOnlyList<ImportedBms> importedFiles)
+    {
+        var sources = new List<MediaSource>();
+        var usedMediaIds = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var imported in importedFiles)
+        {
+            var bmsDirectory = Path.GetDirectoryName(Path.GetFullPath(imported.BmsPath))
+                ?? throw new InvalidDataException("BMSファイルの親ディレクトリを解決できません。");
+
+            foreach (var pair in imported.ImportResult.MediaFiles.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                var originalMediaId = pair.Key;
+                var sourcePath = Path.GetFullPath(Path.Combine(bmsDirectory, pair.Value));
+                var mediaId = ResolveMergedAudioId(originalMediaId, sourcePath, usedMediaIds);
+
+                imported.MediaIdMap[originalMediaId] = mediaId;
+                if (sources.Any(source => source.MediaId.Equals(mediaId, StringComparison.Ordinal)))
+                {
+                    continue;
+                }
+
+                sources.Add(new MediaSource(mediaId, sourcePath, pair.Value));
+            }
+        }
+
+        return sources;
+    }
+
     private static void RemapChartAudioIds(NbmsChart chart, IReadOnlyDictionary<string, string> audioIdMap)
     {
         foreach (var note in chart.Notes)
@@ -251,6 +308,17 @@ public sealed class BmsConversionService
             if (audioIdMap.TryGetValue(backgroundAudio.AudioId, out var audioId))
             {
                 backgroundAudio.AudioId = audioId;
+            }
+        }
+    }
+
+    private static void RemapChartMediaIds(NbmsChart chart, IReadOnlyDictionary<string, string> mediaIdMap)
+    {
+        foreach (var mediaEvent in chart.MediaEvents)
+        {
+            if (mediaIdMap.TryGetValue(mediaEvent.MediaId, out var mediaId))
+            {
+                mediaEvent.MediaId = mediaId;
             }
         }
     }
@@ -323,6 +391,63 @@ public sealed class BmsConversionService
         await manifestStream.WriteAsync("\n"u8.ToArray(), cancellationToken);
     }
 
+    private static Task WriteChartAsync(
+        string chartPath,
+        NbmsChart chart,
+        bool readableScoreJson,
+        CancellationToken cancellationToken)
+    {
+        return readableScoreJson
+            ? NbmsJson.WritePrettyCompactChartAsync(chartPath, chart, cancellationToken)
+            : NbmsJson.WriteCompactChartAsync(chartPath, chart, cancellationToken);
+    }
+
+    private static async Task CreateMediaArchiveAsync(
+        IReadOnlyList<MediaSource> mediaSources,
+        string mediaPath,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(mediaPath)!);
+        await using var stream = File.Create(mediaPath);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
+
+        var manifest = new MediaManifest
+        {
+            Format = "NBMS-MEDIA",
+            Version = "0.1.0"
+        };
+
+        foreach (var source in mediaSources.OrderBy(source => source.MediaId, StringComparer.Ordinal))
+        {
+            var extension = Path.GetExtension(source.OriginalFileName).ToLowerInvariant();
+            var archivePath = $"media/{source.MediaId}{extension}";
+
+            if (File.Exists(source.SourcePath))
+            {
+                archive.CreateEntryFromFile(source.SourcePath, archivePath, CompressionLevel.Optimal);
+            }
+
+            manifest.Entries.Add(new MediaAssetEntry
+            {
+                MediaId = source.MediaId,
+                Path = archivePath,
+                Type = DetectMediaType(source.OriginalFileName),
+                MimeType = DetectMediaMimeType(source.OriginalFileName),
+                Hash = File.Exists(source.SourcePath) ? await ComputeFileSha256Async(source.SourcePath, cancellationToken) : "",
+                RightsId = "converted-bms-media"
+            });
+        }
+
+        var manifestEntry = archive.CreateEntry("manifest.json", CompressionLevel.Optimal);
+        await using var manifestStream = manifestEntry.Open();
+        await System.Text.Json.JsonSerializer.SerializeAsync(
+            manifestStream,
+            manifest,
+            NbmsJson.SerializerOptions,
+            cancellationToken);
+        await manifestStream.WriteAsync("\n"u8.ToArray(), cancellationToken);
+    }
+
     private static string CreateAudioId(string wavKey, string fileName)
     {
         return $"wav_{wavKey}_{Path.GetFileNameWithoutExtension(fileName)}";
@@ -338,6 +463,35 @@ public sealed class BmsConversionService
             ".oga" => "ogg-vorbis",
             ".mp3" => "mp3",
             _ => "unknown"
+        };
+    }
+
+    private static string DetectMediaType(string fileName)
+    {
+        return Path.GetExtension(fileName).ToLowerInvariant() switch
+        {
+            ".bmp" or ".png" or ".jpg" or ".jpeg" or ".gif" => "image",
+            ".mp4" or ".webm" or ".avi" or ".mpg" or ".mpeg" or ".mov" or ".mkv" or ".wmv" => "video",
+            _ => "unknown"
+        };
+    }
+
+    private static string DetectMediaMimeType(string fileName)
+    {
+        return Path.GetExtension(fileName).ToLowerInvariant() switch
+        {
+            ".bmp" => "image/bmp",
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".mp4" => "video/mp4",
+            ".webm" => "video/webm",
+            ".avi" => "video/x-msvideo",
+            ".mpg" or ".mpeg" => "video/mpeg",
+            ".mov" => "video/quicktime",
+            ".mkv" => "video/x-matroska",
+            ".wmv" => "video/x-ms-wmv",
+            _ => "application/octet-stream"
         };
     }
 
@@ -489,9 +643,12 @@ public sealed class BmsConversionService
     private sealed record ImportedBms(
         string BmsPath,
         BmsImportResult ImportResult,
-        Dictionary<string, string> AudioIdMap);
+        Dictionary<string, string> AudioIdMap,
+        Dictionary<string, string> MediaIdMap);
 
     private sealed record AudioSource(string AudioId, string SourcePath, string OriginalFileName);
+
+    private sealed record MediaSource(string MediaId, string SourcePath, string OriginalFileName);
 }
 
 public sealed record BmsConversionResult(string HeaderPath, string ChartPath, string AudioPath);
@@ -501,7 +658,10 @@ public sealed record BmsFolderConversionResult(IReadOnlyList<BmsConversionResult
 public sealed record BmsFolderConversionOptions(
     string Title,
     IReadOnlyDictionary<string, string> LevelNames,
-    string EncodingName);
+    string EncodingName,
+    bool ReadableScoreJson = false);
+
+public sealed record BmsConversionOptions(bool ReadableScoreJson = false);
 
 public sealed record BmsFolderConversionPreview(
     string SourceDirectory,

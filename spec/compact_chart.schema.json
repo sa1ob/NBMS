@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/nbms/0.2/compact-chart.schema.json",
+  "title": "NBMS Compact Chart",
+  "description": "Compact JSON layout for NBMS .nbmc chart files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "version",
+    "encoding",
+    "chartId",
+    "mode",
+    "resolution",
+    "dictionary",
+    "timing",
+    "notes"
+  ],
+  "properties": {
+    "format": {
+      "const": "NBMS-CHART"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^0\\.2\\.\\d+$"
+    },
+    "encoding": {
+      "const": "compact-json"
+    },
+    "chartId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string"
+    },
+    "resolution": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dictionary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lanes",
+        "audio",
+        "media"
+      ],
+      "properties": {
+        "lanes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audio": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "media": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "timing": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tuple"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tuple"
+      }
+    },
+    "backgroundAudio": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tuple"
+      }
+    },
+    "mediaEvents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tuple"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "extensions": {
+      "type": "array"
+    }
+  },
+  "$defs": {
+    "tuple": {
+      "type": "array",
+      "items": {
+        "type": [
+          "integer",
+          "number",
+          "string",
+          "boolean",
+          "null"
+        ]
+      }
+    }
+  }
+}

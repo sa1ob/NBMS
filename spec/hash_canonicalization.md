@@ -10,23 +10,25 @@
 ヘッダーでは以下を使います。
 
 ```text
-sha256-canonical-json
+sha256-compact-canonical-json
 ```
 
 ## 3. Canonicalization Rules
 
-`NBMS 0.1` では、譜面hash計算に以下の規則を使います。
+`NBMS 0.2 compact-json` では、譜面hash計算に以下の規則を使います。
 
 1. `.nbmc` をJSONとしてparseする
-2. duplicate object keysを拒否する
-3. object keyをUnicode code point orderで再帰的にsortする
-4. array orderはそのまま保持する
-5. 不要なwhitespaceなしでJSONを出力する
-6. stringはJSON escaping rulesに従って出力する
-7. numberは値を保持する最短JSON表現で出力する
-8. canonical JSON textをUTF-8でencodeする
-9. UTF-8 bytesに対してSHA-256を計算する
-10. `sha256-` prefixつきlowercase hexadecimalとして保存する
+2. `encoding == "compact-json"` ならcompact chartとして読む
+3. `encoding` がない従来readable-jsonなら内部chart modelへ読む
+4. 内部chart modelからcompact chartを生成する
+5. timing、notes、background audio、media eventsのsort順を固定する
+6. default値とnull値を仕様どおり省略する
+7. object keyをUnicode code point orderで再帰的にsortする
+8. array orderはcompact生成後の順序を保持する
+9. 不要なwhitespaceなしでJSONを出力する
+10. canonical compact JSON textをUTF-8でencodeする
+11. UTF-8 bytesに対してSHA-256を計算する
+12. `sha256-` prefixつきlowercase hexadecimalとして保存する
 
 ## 4. Hash対象
 
@@ -65,23 +67,25 @@ Chart hashes must be stable across operating systems, editors, and JSON formatti
 Headers use:
 
 ```text
-sha256-canonical-json
+sha256-compact-canonical-json
 ```
 
 ## 3. Canonicalization Rules
 
-For `NBMS 0.1`, chart hash calculation uses the following rules:
+For `NBMS 0.2 compact-json`, chart hash calculation uses the following rules:
 
 1. Parse the `.nbmc` file as JSON.
-2. Reject duplicate object keys.
-3. Recursively sort object keys by Unicode code point order.
-4. Preserve array order exactly.
-5. Emit JSON without insignificant whitespace.
-6. Emit strings using JSON escaping rules.
-7. Emit numbers in the shortest JSON representation that preserves the parsed numeric value.
-8. Encode the canonical JSON text as UTF-8.
-9. Calculate SHA-256 over those UTF-8 bytes.
-10. Store the result as lowercase hexadecimal with the `sha256-` prefix.
+2. If `encoding == "compact-json"`, read it as a compact chart.
+3. If `encoding` is absent, read it as the legacy readable-json chart form.
+4. Convert the internal chart model to a compact chart.
+5. Use stable sort order for timing, notes, background audio, and media events.
+6. Omit default and null values according to the compact chart rules.
+7. Recursively sort object keys by Unicode code point order.
+8. Preserve array order after compact generation.
+9. Emit JSON without insignificant whitespace.
+10. Encode the canonical compact JSON text as UTF-8.
+11. Calculate SHA-256 over those UTF-8 bytes.
+12. Store the result as lowercase hexadecimal with the `sha256-` prefix.
 
 ## 4. Hash Target
 
