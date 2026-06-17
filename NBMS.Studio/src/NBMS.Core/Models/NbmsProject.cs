@@ -21,7 +21,9 @@ public sealed class LoadedChart
 public sealed class ProjectIssue
 {
     public string Severity { get; set; } = "Info";
+    public string Code { get; set; } = "";
     public string Source { get; set; } = "";
+    public string TargetReference { get; set; } = "";
     public string Message { get; set; } = "";
 }
 

@@ -11,6 +11,11 @@ public sealed partial class BmsImportService
     private const int Resolution = 960;
     private const int MeasureTicks = Resolution * 4;
 
+    static BmsImportService()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+    }
+
     private static readonly Dictionary<string, string> NoteChannels = new()
     {
         ["11"] = "key1",
@@ -68,8 +73,18 @@ public sealed partial class BmsImportService
         string? encodingName = null,
         CancellationToken cancellationToken = default)
     {
-        var lines = await File.ReadAllLinesAsync(bmsPath, ResolveEncoding(encodingName), cancellationToken);
-        var doc = new BmsImportDocument { SourcePath = bmsPath };
+        var bytes = await File.ReadAllBytesAsync(bmsPath, cancellationToken);
+        var decoded = DecodeBmsText(bytes, encodingName);
+        var lines = SplitBmsLines(decoded.Text);
+        var doc = new BmsImportDocument
+        {
+            SourcePath = bmsPath,
+            SourceExtension = Path.GetExtension(bmsPath).ToLowerInvariant(),
+            SourceEncoding = decoded.EncodingName,
+            CharsetDirective = decoded.CharsetDirective,
+            EncodingDetection = decoded.Detection,
+            EncodingWarnings = decoded.Warnings
+        };
 
         foreach (var rawLine in lines)
         {
@@ -103,26 +118,197 @@ public sealed partial class BmsImportService
         return BuildResult(doc);
     }
 
+    private static BmsDecodedText DecodeBmsText(byte[] bytes, string? requestedEncodingName)
+    {
+        var charsetDirective = FindCharsetDirective(bytes);
+        var warnings = new List<string>();
+
+        if (TryDecodeBom(bytes, out var bomDecoded))
+        {
+            AddCharsetConflictWarning(warnings, charsetDirective, bomDecoded.EncodingName);
+            return bomDecoded with { CharsetDirective = charsetDirective, Warnings = warnings };
+        }
+
+        if (!string.IsNullOrWhiteSpace(requestedEncodingName) &&
+            !requestedEncodingName.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var decoded = DecodeWithEncoding(bytes, requestedEncodingName, "user");
+            AddCharsetConflictWarning(warnings, charsetDirective, decoded.EncodingName);
+            return decoded with { CharsetDirective = charsetDirective, Warnings = warnings };
+        }
+
+        if (!string.IsNullOrWhiteSpace(charsetDirective))
+        {
+            var decoded = DecodeWithEncoding(bytes, charsetDirective, "charset");
+            return decoded with { CharsetDirective = charsetDirective, Warnings = warnings };
+        }
+
+        if (TryDecodeStrictUtf8(bytes, out var utf8Text))
+        {
+            return new BmsDecodedText(utf8Text, "utf-8", "utf8Strict", charsetDirective, warnings);
+        }
+
+        var fallback = DecodeWithEncoding(bytes, "shift_jis", "fallback");
+        return fallback with { CharsetDirective = charsetDirective, Warnings = warnings };
+    }
+
+    private static string[] SplitBmsLines(string text)
+    {
+        return text
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n');
+    }
+
+    private static bool TryDecodeBom(byte[] bytes, out BmsDecodedText decoded)
+    {
+        if (bytes.Length >= 3 &&
+            bytes[0] == 0xEF &&
+            bytes[1] == 0xBB &&
+            bytes[2] == 0xBF)
+        {
+            decoded = new BmsDecodedText(new UTF8Encoding(false, true).GetString(bytes, 3, bytes.Length - 3), "utf-8", "bom", null, []);
+            return true;
+        }
+
+        if (bytes.Length >= 2 &&
+            bytes[0] == 0xFF &&
+            bytes[1] == 0xFE)
+        {
+            decoded = new BmsDecodedText(Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2), "utf-16le", "bom", null, []);
+            return true;
+        }
+
+        if (bytes.Length >= 2 &&
+            bytes[0] == 0xFE &&
+            bytes[1] == 0xFF)
+        {
+            decoded = new BmsDecodedText(Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2), "utf-16be", "bom", null, []);
+            return true;
+        }
+
+        decoded = new BmsDecodedText("", "", "", null, []);
+        return false;
+    }
+
+    private static bool TryDecodeStrictUtf8(byte[] bytes, out string text)
+    {
+        try
+        {
+            text = new UTF8Encoding(false, true).GetString(bytes);
+            return true;
+        }
+        catch (DecoderFallbackException)
+        {
+            text = "";
+            return false;
+        }
+    }
+
+    private static BmsDecodedText DecodeWithEncoding(byte[] bytes, string encodingName, string detection)
+    {
+        var encoding = ResolveEncoding(encodingName);
+        return new BmsDecodedText(encoding.GetString(bytes), NormalizeEncodingName(encoding), detection, null, []);
+    }
+
     private static Encoding ResolveEncoding(string? encodingName)
     {
-        if (string.IsNullOrWhiteSpace(encodingName) ||
-            encodingName.Equals("utf-8", StringComparison.OrdinalIgnoreCase))
+        var normalized = NormalizeRequestedEncodingName(encodingName);
+        if (normalized == "utf-8")
         {
             return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
         }
 
-        if (encodingName.Equals("system-default", StringComparison.OrdinalIgnoreCase))
+        if (normalized == "utf-16le")
+        {
+            return Encoding.Unicode;
+        }
+
+        if (normalized == "utf-16be")
+        {
+            return Encoding.BigEndianUnicode;
+        }
+
+        if (normalized == "system-default")
         {
             return Encoding.Default;
         }
 
         try
         {
-            return Encoding.GetEncoding(encodingName);
+            return Encoding.GetEncoding(normalized);
         }
         catch
         {
-            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
+            return Encoding.GetEncoding(932);
+        }
+    }
+
+    private static string? FindCharsetDirective(byte[] bytes)
+    {
+        var ascii = Encoding.ASCII.GetString(bytes);
+        foreach (var rawLine in SplitBmsLines(ascii))
+        {
+            var line = rawLine.Trim();
+            if (!line.StartsWith("#CHARSET", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var parts = line.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2)
+            {
+                return parts[1].Trim();
+            }
+        }
+
+        return null;
+    }
+
+    private static string NormalizeRequestedEncodingName(string? encodingName)
+    {
+        if (string.IsNullOrWhiteSpace(encodingName))
+        {
+            return "utf-8";
+        }
+
+        var normalized = encodingName.Trim().ToLowerInvariant().Replace("_", "-", StringComparison.Ordinal);
+        return normalized switch
+        {
+            "auto" => "utf-8",
+            "utf8" or "utf-8-bom" => "utf-8",
+            "utf16" or "utf-16" or "utf-16-le" => "utf-16le",
+            "utf-16-be" => "utf-16be",
+            "shift-jis" or "shift_jis" or "sjis" or "cp932" or "windows-31j" => "shift_jis",
+            "euc-kr" or "euckr" or "ks-c-5601-1987" => "euc-kr",
+            _ => normalized
+        };
+    }
+
+    private static string NormalizeEncodingName(Encoding encoding)
+    {
+        return encoding.CodePage switch
+        {
+            65001 => "utf-8",
+            1200 => "utf-16le",
+            1201 => "utf-16be",
+            932 => "shift_jis",
+            949 => "euc-kr",
+            _ => encoding.WebName
+        };
+    }
+
+    private static void AddCharsetConflictWarning(List<string> warnings, string? charsetDirective, string actualEncoding)
+    {
+        if (string.IsNullOrWhiteSpace(charsetDirective))
+        {
+            return;
+        }
+
+        var declared = NormalizeRequestedEncodingName(charsetDirective);
+        if (!declared.Equals(actualEncoding, StringComparison.OrdinalIgnoreCase))
+        {
+            warnings.Add($"#CHARSET {charsetDirective} ignored; decoded as {actualEncoding}.");
         }
     }
 
@@ -165,6 +351,14 @@ public sealed partial class BmsImportService
         {
             doc.BgaDefinitions[key[3..]] = value;
         }
+        else if (upperKey.StartsWith("LAYER", StringComparison.Ordinal) && key.Length == 7)
+        {
+            doc.LayerDefinitions[key[5..]] = value;
+        }
+        else if (upperKey.StartsWith("POOR", StringComparison.Ordinal) && key.Length == 6)
+        {
+            doc.PoorDefinitions[key[4..]] = value;
+        }
         else if (upperKey == "STAGEFILE")
         {
             doc.StageFile = value;
@@ -199,6 +393,8 @@ public sealed partial class BmsImportService
         var wavToAudioId = doc.Wav.ToDictionary(pair => pair.Key, pair => CreateAudioId(pair.Key, pair.Value), StringComparer.Ordinal);
         var bmpToMediaId = doc.Bmp.ToDictionary(pair => pair.Key, pair => CreateMediaId("bmp", pair.Key, pair.Value), StringComparer.Ordinal);
         var bgaToMediaId = BuildBgaMediaIdMap(doc, bmpToMediaId);
+        var layerToMediaId = BuildVisualDefinitionMediaIdMap(doc.LayerDefinitions, "layer", bmpToMediaId, bgaToMediaId);
+        var poorToMediaId = BuildVisualDefinitionMediaIdMap(doc.PoorDefinitions, "poor", bmpToMediaId, bgaToMediaId);
         var mode = ResolveMode(doc);
         var chart = CreateBaseChart(doc, mode);
         var backgroundLaneCountsByTick = new Dictionary<int, int>();
@@ -230,7 +426,7 @@ public sealed partial class BmsImportService
                 }
 
                 var tick = ResolveTick(line.Measure, index, tokens.Count, measureStarts, doc.MeasureLengths);
-                AddChannelEvent(doc, chart, line.Channel, token, tick, wavToAudioId, bmpToMediaId, bgaToMediaId, backgroundLaneCountsByTick, longNoteStarts, lnObjStarts);
+                AddChannelEvent(doc, chart, line.Channel, token, tick, wavToAudioId, bmpToMediaId, bgaToMediaId, layerToMediaId, poorToMediaId, backgroundLaneCountsByTick, longNoteStarts, lnObjStarts);
             }
         }
 
@@ -309,13 +505,20 @@ public sealed partial class BmsImportService
             chart.Timing.Add(new TimingEvent { Tick = 0, Type = "lnobj", Event = doc.LnObj });
         }
 
-        if (doc.RandomDirectives.Count > 0 || ResolveSourceFormat(doc) != "bms")
+        if (doc.RandomDirectives.Count > 0 ||
+            ResolveSourceFormat(doc) != "bms" ||
+            !string.IsNullOrWhiteSpace(doc.SourceEncoding))
         {
             chart.Metadata = JsonSerializer.SerializeToElement(new
             {
                 bmsCompat = new
                 {
                     sourceFormat = ResolveSourceFormat(doc),
+                    sourceExtension = doc.SourceExtension,
+                    sourceEncoding = doc.SourceEncoding,
+                    charsetDirective = doc.CharsetDirective,
+                    encodingDetection = doc.EncodingDetection,
+                    encodingWarnings = doc.EncodingWarnings,
                     randomDirectives = doc.RandomDirectives
                 }
             });
@@ -338,6 +541,8 @@ public sealed partial class BmsImportService
         IReadOnlyDictionary<string, string> wavToAudioId,
         IReadOnlyDictionary<string, string> bmpToMediaId,
         IReadOnlyDictionary<string, string> bgaToMediaId,
+        IReadOnlyDictionary<string, string> layerToMediaId,
+        IReadOnlyDictionary<string, string> poorToMediaId,
         Dictionary<int, int> backgroundLaneCountsByTick,
         Dictionary<string, PendingLongNote> longNoteStarts,
         Dictionary<string, PendingLongNote> lnObjStarts)
@@ -360,13 +565,14 @@ public sealed partial class BmsImportService
             chart.Timing.Add(new TimingEvent { Tick = tick, Type = "stop", DurationTicks = StopValueToTicks(stopValue) });
         }
         else if ((channel == "04" || channel == "07" || channel == "06") &&
-                 TryResolveMediaId(token, bmpToMediaId, bgaToMediaId, out var mediaId))
+                 TryResolveMediaId(channel, token, bmpToMediaId, bgaToMediaId, layerToMediaId, poorToMediaId, out var mediaId))
         {
+            var eventType = ResolveMediaEventType(doc, channel, token, mediaId);
             chart.MediaEvents.Add(new MediaEvent
             {
                 Tick = tick,
                 MediaId = mediaId,
-                Type = channel == "06" ? "poor" : "image",
+                Type = eventType,
                 Layer = channel == "07" ? 1 : 0
             });
         }
@@ -466,14 +672,119 @@ public sealed partial class BmsImportService
         return result;
     }
 
+    private static Dictionary<string, string> BuildVisualDefinitionMediaIdMap(
+        IReadOnlyDictionary<string, string> definitions,
+        string kind,
+        IReadOnlyDictionary<string, string> bmpToMediaId,
+        IReadOnlyDictionary<string, string> bgaToMediaId)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in definitions)
+        {
+            var firstToken = pair.Value
+                .Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault();
+            if (firstToken is null)
+            {
+                continue;
+            }
+
+            if (bmpToMediaId.TryGetValue(firstToken, out var bmpMediaId) ||
+                bgaToMediaId.TryGetValue(firstToken, out bmpMediaId!))
+            {
+                result[pair.Key] = bmpMediaId;
+                continue;
+            }
+
+            result[pair.Key] = CreateMediaId(kind, pair.Key, firstToken);
+        }
+
+        return result;
+    }
+
     private static bool TryResolveMediaId(
+        string channel,
         string token,
         IReadOnlyDictionary<string, string> bmpToMediaId,
         IReadOnlyDictionary<string, string> bgaToMediaId,
+        IReadOnlyDictionary<string, string> layerToMediaId,
+        IReadOnlyDictionary<string, string> poorToMediaId,
         out string mediaId)
     {
+        if (channel == "07" && layerToMediaId.TryGetValue(token, out mediaId!))
+        {
+            return true;
+        }
+
+        if (channel == "06" && poorToMediaId.TryGetValue(token, out mediaId!))
+        {
+            return true;
+        }
+
         return bmpToMediaId.TryGetValue(token, out mediaId!) ||
-               bgaToMediaId.TryGetValue(token, out mediaId!);
+               bgaToMediaId.TryGetValue(token, out mediaId!) ||
+               layerToMediaId.TryGetValue(token, out mediaId!) ||
+               poorToMediaId.TryGetValue(token, out mediaId!);
+    }
+
+    private static string ResolveMediaEventType(BmsImportDocument doc, string channel, string token, string mediaId)
+    {
+        if (channel == "06")
+        {
+            return "poor";
+        }
+
+        if (channel == "07")
+        {
+            return "layer";
+        }
+
+        return IsLikelyVideoMedia(ResolveMediaFileName(doc, token, mediaId)) ? "video" : "bga";
+    }
+
+    private static string ResolveMediaFileName(BmsImportDocument doc, string token, string mediaId)
+    {
+        if (doc.Bmp.TryGetValue(token, out var bmp))
+        {
+            return bmp;
+        }
+
+        if (doc.BgaDefinitions.TryGetValue(token, out var bga))
+        {
+            var firstToken = bga.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (firstToken is not null && doc.Bmp.TryGetValue(firstToken, out var referencedBmp))
+            {
+                return referencedBmp;
+            }
+        }
+
+        var directLayer = doc.LayerDefinitions
+            .Select(pair => new
+            {
+                pair.Key,
+                FileName = pair.Value.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? ""
+            })
+            .FirstOrDefault(pair => CreateMediaId("layer", pair.Key, pair.FileName) == mediaId)
+            ?.FileName;
+        if (!string.IsNullOrWhiteSpace(directLayer))
+        {
+            return directLayer;
+        }
+
+        var directPoor = doc.PoorDefinitions
+            .Select(pair => new
+            {
+                pair.Key,
+                FileName = pair.Value.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? ""
+            })
+            .FirstOrDefault(pair => CreateMediaId("poor", pair.Key, pair.FileName) == mediaId)
+            ?.FileName;
+        return directPoor ?? "";
+    }
+
+    private static bool IsLikelyVideoMedia(string fileName)
+    {
+        return Path.GetExtension(fileName).ToLowerInvariant() is ".mp4" or ".avi" or ".webm" or ".mov" or ".mkv" or ".wmv" or ".mpg" or ".mpeg";
     }
 
     private static void AddInitialMediaEvents(BmsImportDocument doc, NbmsChart chart)
@@ -509,10 +820,33 @@ public sealed partial class BmsImportService
             mediaFiles[CreateMediaId("bmp", pair.Key, pair.Value)] = pair.Value;
         }
 
+        AddVisualDefinitionMediaFiles(mediaFiles, "layer", doc.LayerDefinitions, doc);
+        AddVisualDefinitionMediaFiles(mediaFiles, "poor", doc.PoorDefinitions, doc);
+
         AddHeaderMediaFile(mediaFiles, "stagefile", doc.StageFile);
         AddHeaderMediaFile(mediaFiles, "banner", doc.Banner);
         AddHeaderMediaFile(mediaFiles, "backbmp", doc.BackBmp);
         return mediaFiles;
+    }
+
+    private static void AddVisualDefinitionMediaFiles(
+        Dictionary<string, string> mediaFiles,
+        string kind,
+        IReadOnlyDictionary<string, string> definitions,
+        BmsImportDocument doc)
+    {
+        foreach (var pair in definitions)
+        {
+            var firstToken = pair.Value.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(firstToken) ||
+                doc.Bmp.ContainsKey(firstToken) ||
+                doc.BgaDefinitions.ContainsKey(firstToken))
+            {
+                continue;
+            }
+
+            mediaFiles[CreateMediaId(kind, pair.Key, firstToken)] = firstToken;
+        }
     }
 
     private static void AddHeaderMediaFile(Dictionary<string, string> mediaFiles, string kind, string? fileName)
@@ -743,6 +1077,13 @@ public sealed partial class BmsImportService
     private static partial Regex HeaderLineRegex();
 
     private sealed record PendingLongNote(int Tick, string Lane, string AudioId);
+
+    private sealed record BmsDecodedText(
+        string Text,
+        string EncodingName,
+        string Detection,
+        string? CharsetDirective,
+        List<string> Warnings);
 }
 
 public sealed record BmsImportResult(
@@ -754,6 +1095,11 @@ public sealed record BmsImportResult(
 internal sealed class BmsImportDocument
 {
     public string SourcePath { get; set; } = "";
+    public string SourceExtension { get; set; } = "";
+    public string SourceEncoding { get; set; } = "";
+    public string EncodingDetection { get; set; } = "";
+    public string? CharsetDirective { get; set; }
+    public List<string> EncodingWarnings { get; set; } = [];
     public string Title { get; set; } = "Untitled";
     public string Artist { get; set; } = "Unknown Artist";
     public string Genre { get; set; } = "";
@@ -766,6 +1112,8 @@ internal sealed class BmsImportDocument
     public Dictionary<string, string> Wav { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, string> Bmp { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, string> BgaDefinitions { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> LayerDefinitions { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> PoorDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> BpmDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> StopDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<int, double> MeasureLengths { get; } = [];

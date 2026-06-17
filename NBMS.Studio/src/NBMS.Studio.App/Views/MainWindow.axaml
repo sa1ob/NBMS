@@ -38,8 +38,12 @@
         <MenuItem Header="Undo" Click="Undo_Click" IsEnabled="{Binding CanUndoEditorCommand}" />
         <MenuItem Header="Redo" Click="Redo_Click" IsEnabled="{Binding CanRedoEditorCommand}" />
         <Separator />
+        <MenuItem Header="Insert measure" Click="InsertMeasure_Click" />
+        <MenuItem Header="Delete measure" Click="DeleteMeasure_Click" />
+        <Separator />
         <MenuItem Header="Copy" Click="Copy_Click" />
         <MenuItem Header="Paste" Click="Paste_Click" IsEnabled="{Binding CanPasteEditorObject}" />
+        <MenuItem Header="選択オブジェクトのAudioIdを選択音源へ置換" Click="ReplaceSelectedObjectsAudioId_Click" />
       </MenuItem>
       <MenuItem Header="表示">
         <MenuItem Header="タイムライン" IsEnabled="False" />
@@ -56,6 +60,8 @@
         <MenuItem Header="MonoGame Viewerを開く" Click="MonoGameViewer_Click" />
         <Separator />
         <MenuItem Header="MonoGame Viewerのパスを設定..." Click="SetMonoGameViewerPath_Click" />
+        <MenuItem Header="ffmpeg.exeのパスを設定..." Click="SetFfmpegPath_Click" />
+        <MenuItem Header="BGA読み込み 有効/無効を切り替え" Click="ToggleMonoGameViewerBga_Click" />
       </MenuItem>
       <MenuItem Header="ヘルプ">
         <!-- 
@@ -66,7 +72,7 @@
     </Menu>
 
     <Border DockPanel.Dock="Top" Background="#242933" Padding="8">
-      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,24,*">
+      <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,24,*">
         <Button Grid.Column="0" Content="開く" Click="OpenNbms_Click" MinWidth="72" Margin="0,0,8,0" />
         <Button Grid.Column="1" Content="BMS一括変換" Click="ConvertBms_Click" MinWidth="112" Margin="0,0,8,0" />
         <Button Grid.Column="2" Content="保存" Click="Save_Click" MinWidth="72" Margin="0,0,8,0" />
@@ -76,10 +82,14 @@
             <ContextMenu>
               <MenuItem Header="MonoGame Viewerを開く" Click="MonoGameViewer_Click" />
               <MenuItem Header="MonoGame Viewerのパスを設定..." Click="SetMonoGameViewerPath_Click" />
+              <MenuItem Header="ffmpeg.exeのパスを設定..." Click="SetFfmpegPath_Click" />
+              <MenuItem Header="BGA読み込み 有効/無効を切り替え" Click="ToggleMonoGameViewerBga_Click" />
             </ContextMenu>
           </Button.ContextMenu>
         </Button>
-        <TextBlock Grid.Column="6"
+        <Button Grid.Column="5" Content="From tick" Click="PlaybackFromEditorPosition_Click" MinWidth="80" Margin="0,0,8,0" />
+        <Button Grid.Column="6" Content="Range play" Click="PlaybackSelectedRange_Click" MinWidth="88" Margin="0,0,8,0" />
+        <TextBlock Grid.Column="8"
                    Text="{Binding StatusText}"
                    Foreground="#e5e7eb"
                    VerticalAlignment="Center"
@@ -117,7 +127,7 @@
           </Grid>
 
           <TabControl Grid.Row="2">
-            <TabItem Header="Charts">
+            <TabItem Header="Charts" FontSize="12">
               <DataGrid ItemsSource="{Binding Charts}"
                         SelectedItem="{Binding SelectedChartRow, Mode=TwoWay}"
                         AutoGenerateColumns="False"
@@ -129,15 +139,48 @@
                 </DataGrid.Columns>
               </DataGrid>
             </TabItem>
-            <TabItem Header="{Binding EventSummaryText}">
-              <ListBox ItemsSource="{Binding Events}"
-                       SelectedItem="{Binding SelectedEventRow, Mode=TwoWay}"
-                       SelectionChanged="EventSelectionChanged"
-                       Background="White"
-                       Foreground="#111827" />
+            <TabItem Header="Inspector" FontSize="12">
+              <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="8" Margin="4">
+                  <TextBlock Text="{Binding InspectorKindText}" FontWeight="SemiBold" Foreground="#ffffff" />
+                  <Grid ColumnDefinitions="72,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Tick" Foreground="#ffffff" VerticalAlignment="Center" />
+                    <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding DraftTick}" Foreground="#111827" Background="White" />
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Lane" Foreground="#ffffff" VerticalAlignment="Center" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding DraftLane}" Foreground="#111827" Background="White" />
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Type" Foreground="#ffffff" VerticalAlignment="Center" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding DraftType}" Foreground="#111827" Background="White" />
+                    <TextBlock Grid.Row="3" Grid.Column="0" Text="Value/Id" Foreground="#ffffff" VerticalAlignment="Center" />
+                    <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding DraftAudioId}" Foreground="#111827" Background="White" />
+                    <TextBlock Grid.Row="4" Grid.Column="0" Text="Dur/Layer" Foreground="rgb(255, 255, 255)" VerticalAlignment="Center" />
+                    <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding DraftDurationTicks}" Foreground="#111827" Background="White" />
+                  </Grid>
+                  <UniformGrid Columns="2">
+                    <Button Content="Apply" Click="ApplyInspector_Click" Margin="0,0,4,0" />
+                    <Button Content="Delete" Click="DeleteInspector_Click" Margin="4,0,0,0" />
+                  </UniformGrid>
+                  <TextBlock Text="Value/Id is audioId, BPM value, LNOBJ id, or mediaId. Dur/Layer is note duration, STOP duration, or media layer."
+                             Foreground="#ffffff"
+                             TextWrapping="Wrap" />
+                </StackPanel>
+              </ScrollViewer>
             </TabItem>
-            <TabItem Header="{Binding IssueSummaryText}">
+            <TabItem Header="{Binding EventSummaryText}" FontSize="12">
               <Grid RowDefinitions="*,Auto">
+                <ListBox Grid.Row="0"
+                         ItemsSource="{Binding Events}"
+                         SelectedItem="{Binding SelectedEventRow, Mode=TwoWay}"
+                         SelectionChanged="EventSelectionChanged"
+                         Background="White"
+                         Foreground="#111827" />
+                <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
+                  <Button Content="Edit" Click="EditSelectedEvent_Click" IsEnabled="{Binding CanEditSelectedEvent}" Margin="0,0,4,0" />
+                  <Button Content="Delete" Click="DeleteSelectedEvent_Click" IsEnabled="{Binding CanEditSelectedEvent}" Margin="4,0,0,0" />
+                </UniformGrid>
+              </Grid>
+            </TabItem>
+            <TabItem Header="{Binding IssueSummaryText}" FontSize="12">
+              <Grid RowDefinitions="*,Auto,Auto">
                 <DataGrid Grid.Row="0"
                           ItemsSource="{Binding Issues}"
                           SelectedItem="{Binding SelectedIssueRow, Mode=TwoWay}"
@@ -145,22 +188,38 @@
                           IsReadOnly="True">
                   <DataGrid.Columns>
                     <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="62" />
+                    <DataGridTextColumn Header="Code" Binding="{Binding Code}" Width="120" />
                     <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="72" />
+                    <DataGridTextColumn Header="Target" Binding="{Binding TargetReference}" Width="120" />
                     <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*" />
                   </DataGrid.Columns>
                 </DataGrid>
-                <Button Grid.Row="1"
-                        Content="Fix with selected audio"
-                        Click="RepairSelectedMissingAudioReference_Click"
-                        IsEnabled="{Binding CanRepairMissingAudioReference}"
-                        Margin="0,6,0,0" />
+                <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
+                  <Button Content="Fix audio ref"
+                          Click="RepairSelectedMissingAudioReference_Click"
+                          IsEnabled="{Binding CanRepairMissingAudioReference}"
+                          Margin="0,0,4,4" />
+                  <Button Content="Jump"
+                          Click="JumpToIssue_Click"
+                          IsEnabled="{Binding CanJumpToSelectedIssue}"
+                          Margin="4,0,0,4" />
+                  <Button Content="Auto fix"
+                          Click="AutoFixIssue_Click"
+                          IsEnabled="{Binding CanAutoFixSelectedIssue}"
+                          Margin="0,4,4,0" />
+                  <Button Content="Validate package"
+                          Click="ValidatePackage_Click"
+                          Margin="4,4,0,0" />
+                </UniformGrid>
               </Grid>
             </TabItem>
-            <TabItem Header="{Binding AudioSummaryText}">
-              <Grid RowDefinitions="*,Auto,Auto">
-                <ListBox Grid.Row="0"
+            <TabItem Header="{Binding AudioSummaryText}" FontSize="12">
+              <Grid RowDefinitions="*,Auto,Auto,Auto">
+                <ListBox x:Name="AudioAssetListBox"
+                         Grid.Row="0"
                          ItemsSource="{Binding AudioEntries}"
                          SelectedItem="{Binding SelectedAudioRow, Mode=TwoWay}"
+                         SelectionMode="Multiple"
                          Background="White"
                          Foreground="#111827" />
                 <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
@@ -170,17 +229,23 @@
                   <Button Content="Remove unused" Click="RemoveUnusedAudioAssets_Click" Margin="4,4,0,0" />
                 </UniformGrid>
                 <Button Grid.Row="2"
+                        Content="Check audio pack"
+                        Click="CheckAudioArchive_Click"
+                        Margin="0,6,0,0" />
+                <Button Grid.Row="3"
                         Content="Preview selected audio"
                         Click="PreviewSelectedAudio_Click"
                         IsEnabled="{Binding CanPreviewSelectedAudio}"
                         Margin="0,6,0,0" />
               </Grid>
             </TabItem>
-            <TabItem Header="{Binding MediaSummaryText}">
-              <Grid RowDefinitions="*,Auto">
-                <ListBox Grid.Row="0"
+            <TabItem Header="{Binding MediaSummaryText}" FontSize="12">
+              <Grid RowDefinitions="*,Auto,Auto,Auto">
+                <ListBox x:Name="MediaAssetListBox"
+                         Grid.Row="0"
                          ItemsSource="{Binding MediaAssetEntries}"
                          SelectedItem="{Binding SelectedMediaAssetRow, Mode=TwoWay}"
+                         SelectionMode="Multiple"
                          Background="White"
                          Foreground="#111827" />
                 <UniformGrid Grid.Row="1" Columns="2" Margin="0,6,0,0">
@@ -189,6 +254,15 @@
                   <Button Content="Delete" Click="DeleteMediaAsset_Click" IsEnabled="{Binding CanEditSelectedMediaAsset}" Margin="0,4,4,0" />
                   <Button Content="Remove unused" Click="RemoveUnusedMediaAssets_Click" Margin="4,4,0,0" />
                 </UniformGrid>
+                <Button Grid.Row="2"
+                        Content="Check media pack"
+                        Click="CheckMediaArchive_Click"
+                        Margin="0,6,0,0" />
+                <Button Grid.Row="3"
+                        Content="Preview selected media"
+                        Click="PreviewSelectedMedia_Click"
+                        IsEnabled="{Binding CanPreviewSelectedMediaAsset}"
+                        Margin="0,6,0,0" />
               </Grid>
             </TabItem>
           </TabControl>
@@ -198,7 +272,7 @@
       <Border Grid.Row="0" Grid.Column="1" Margin="8,0" Background="White" BorderBrush="#d3d8df" BorderThickness="1">
         <Grid RowDefinitions="Auto,*">
           <Border Grid.Row="0" Background="#d0d6f5" Padding="8">
-            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto">
               <TextBlock Text="Timeline Viewer / Editor" FontWeight="SemiBold" VerticalAlignment="Center" />
               <TextBlock Grid.Column="1" Text="Grid" Margin="0,0,6,0" VerticalAlignment="Center" />
               <ComboBox Grid.Column="2"
@@ -206,6 +280,16 @@
                         SelectedItem="{Binding EditorGridDivision, Mode=TwoWay}"
                         MinWidth="72"
                         Margin="0,0,8,0" />
+              <CheckBox Grid.Column="3"
+                        Content="Snap"
+                        IsChecked="{Binding IsEditorSnapEnabled, Mode=TwoWay}"
+                        VerticalAlignment="Center"
+                        Foreground="#111827"
+                        Margin="0,0,8,0" />
+              <Button Grid.Column="4"
+                      Content="Grid settings..."
+                      Click="GridSettings_Click"
+                      MinWidth="112" />
             </Grid>
           </Border>
           <ScrollViewer x:Name="EditorTimelineScrollViewer"
@@ -221,6 +305,7 @@
                                      GridTicks="{Binding EditorGridTicks}"
                                      SelectedTick="{Binding EditorSelectedTick}"
                                      SelectedLane="{Binding EditorSelectedLane}"
+                                     SelectedObjectKeys="{Binding EditorSelectedObjectKeys}"
                                      SizeChanged="EditorTimelineCanvas_SizeChanged"
                                      Height="{Binding EditorTimelineHeight}" />
           </ScrollViewer>

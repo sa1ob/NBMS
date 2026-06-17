@@ -8,9 +8,9 @@ namespace NBMS.Studio.MonoGameViewer;
 public sealed class ViewerAudioBank : IDisposable
 {
     private readonly string _tempDirectory;
-    private readonly Dictionary<string, string> _filesByAudioId;
+    private readonly Dictionary<string, ViewerAudioFile> _filesByAudioId;
 
-    private ViewerAudioBank(string tempDirectory, Dictionary<string, string> filesByAudioId)
+    private ViewerAudioBank(string tempDirectory, Dictionary<string, ViewerAudioFile> filesByAudioId)
     {
         _tempDirectory = tempDirectory;
         _filesByAudioId = filesByAudioId;
@@ -18,8 +18,7 @@ public sealed class ViewerAudioBank : IDisposable
 
     public int Count => _filesByAudioId.Count;
 
-    public IEnumerable<ViewerAudioFile> Files => _filesByAudioId
-        .Select(pair => new ViewerAudioFile(pair.Key, pair.Value));
+    public IEnumerable<ViewerAudioFile> Files => _filesByAudioId.Values;
 
     public static ViewerAudioBank Load(string audioArchivePath, IEnumerable<string> requiredAudioIds)
     {
@@ -37,7 +36,7 @@ public sealed class ViewerAudioBank : IDisposable
         var manifest = JsonSerializer.Deserialize<AudioManifest>(manifestStream, NbmsJson.SerializerOptions)
             ?? throw new InvalidDataException("audio manifest was empty.");
 
-        var filesByAudioId = new Dictionary<string, string>(StringComparer.Ordinal);
+        var filesByAudioId = new Dictionary<string, ViewerAudioFile>(StringComparer.Ordinal);
         foreach (var entry in manifest.Entries)
         {
             if (required.Count > 0 && !required.Contains(entry.AudioId))
@@ -59,7 +58,10 @@ public sealed class ViewerAudioBank : IDisposable
 
             var outputPath = Path.Combine(tempDirectory, $"{SanitizeFileName(entry.AudioId)}{extension}");
             archiveEntry.ExtractToFile(outputPath, overwrite: true);
-            filesByAudioId[entry.AudioId] = outputPath;
+            filesByAudioId[entry.AudioId] = new ViewerAudioFile(
+                entry.AudioId,
+                outputPath,
+                Math.Max(0, entry.DurationMs) / 1000.0);
         }
 
         return new ViewerAudioBank(tempDirectory, filesByAudioId);
@@ -67,7 +69,21 @@ public sealed class ViewerAudioBank : IDisposable
 
     public bool TryGetFilePath(string audioId, out string filePath)
     {
-        return _filesByAudioId.TryGetValue(audioId, out filePath!);
+        if (_filesByAudioId.TryGetValue(audioId, out var file))
+        {
+            filePath = file.FilePath;
+            return true;
+        }
+
+        filePath = "";
+        return false;
+    }
+
+    public double ResolveDurationSeconds(string audioId)
+    {
+        return _filesByAudioId.TryGetValue(audioId, out var file) && file.DurationSeconds > 0
+            ? file.DurationSeconds
+            : 0.25;
     }
 
     public void Dispose()
@@ -101,4 +117,4 @@ public sealed class ViewerAudioBank : IDisposable
     }
 }
 
-public sealed record ViewerAudioFile(string AudioId, string FilePath);
+public sealed record ViewerAudioFile(string AudioId, string FilePath, double DurationSeconds);

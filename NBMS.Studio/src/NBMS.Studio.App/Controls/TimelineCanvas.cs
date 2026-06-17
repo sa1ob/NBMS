@@ -14,7 +14,7 @@ public sealed class TimelineCanvas : Control
     private const double TimelineBottomPadding = 12.0;
     private const double PixelsPerTick = 0.125;
     private const double TwoPlayerGapWidth = 18.0;
-    private const int TwoPlayerGapBeforeLaneIndex = 12;
+    private const int TwoPlayerGapBeforeLaneIndex = 16;
 
     public static readonly StyledProperty<IEnumerable?> ItemsProperty =
         AvaloniaProperty.Register<TimelineCanvas, IEnumerable?>(nameof(Items));
@@ -37,8 +37,15 @@ public sealed class TimelineCanvas : Control
     public static readonly StyledProperty<string> SelectedLaneProperty =
         AvaloniaProperty.Register<TimelineCanvas, string>(nameof(SelectedLane), "");
 
+    public static readonly StyledProperty<IEnumerable?> SelectedObjectKeysProperty =
+        AvaloniaProperty.Register<TimelineCanvas, IEnumerable?>(nameof(SelectedObjectKeys));
+
     private Point? _dragStartPoint;
     private TimelineHitEventArgs? _dragStartHit;
+    private TimelineHitEventArgs? _dragCurrentHit;
+    private bool _isRangeSelecting;
+    private Point? _rangeSelectionStartPoint;
+    private Point? _rangeSelectionCurrentPoint;
 
     private static readonly string[] SevenKeyLanes =
     [
@@ -47,6 +54,9 @@ public sealed class TimelineCanvas : Control
         "bpm",
         "stop",
         "measure",
+        "bga",
+        "layer",
+        "poor",
         "scratch",
         "key1",
         "key2",
@@ -72,6 +82,9 @@ public sealed class TimelineCanvas : Control
         "bpm",
         "stop",
         "measure",
+        "bga",
+        "layer",
+        "poor",
         "scratch",
         "key1",
         "key2",
@@ -140,8 +153,15 @@ public sealed class TimelineCanvas : Control
         set => SetValue(SelectedLaneProperty, value);
     }
 
+    public IEnumerable? SelectedObjectKeys
+    {
+        get => GetValue(SelectedObjectKeysProperty);
+        set => SetValue(SelectedObjectKeysProperty, value);
+    }
+
     public event EventHandler<TimelineHitEventArgs>? TimelineHit;
     public event EventHandler<TimelineDragEventArgs>? TimelineDragCompleted;
+    public event EventHandler<TimelineRangeSelectionEventArgs>? TimelineRangeSelected;
 
     static TimelineCanvas()
     {
@@ -152,6 +172,7 @@ public sealed class TimelineCanvas : Control
         AffectsRender<TimelineCanvas>(GridTicksProperty);
         AffectsRender<TimelineCanvas>(SelectedTickProperty);
         AffectsRender<TimelineCanvas>(SelectedLaneProperty);
+        AffectsRender<TimelineCanvas>(SelectedObjectKeysProperty);
     }
 
     public override void Render(DrawingContext context)
@@ -173,8 +194,11 @@ public sealed class TimelineCanvas : Control
         DrawMeasureGrid(context, bounds, StartTick, GridTicks, (MeasureGridLines ?? Array.Empty<object>()).OfType<MeasureGridLineRow>().ToList());
         DrawLaneSeparators(context, bounds, lanes);
         DrawLaneHeaders(context, bounds, lanes);
-        DrawEvents(context, bounds, rows, lanes, StartTick, SelectedTick, SelectedLane);
+        var selectedObjectKeys = ResolveSelectedObjectKeySet();
+        DrawEvents(context, bounds, rows, lanes, StartTick, SelectedTick, SelectedLane, selectedObjectKeys);
+        DrawDragPreview(context, bounds, rows, lanes, selectedObjectKeys);
         DrawStartLine(context, bounds, StartTick);
+        DrawRangeSelection(context);
     }
 
     protected override void OnPointerPressed(PointerPressedEventArgs e)
@@ -201,6 +225,17 @@ public sealed class TimelineCanvas : Control
             return;
         }
 
+        if (button == TimelineHitButton.Left && e.KeyModifiers.HasFlag(KeyModifiers.Shift))
+        {
+            _isRangeSelecting = true;
+            _rangeSelectionStartPoint = e.GetPosition(this);
+            _rangeSelectionCurrentPoint = _rangeSelectionStartPoint;
+            e.Pointer.Capture(this);
+            InvalidateVisual();
+            e.Handled = true;
+            return;
+        }
+
         TimelineHit?.Invoke(this, hit);
         if (button == TimelineHitButton.Left && e.ClickCount == 1)
         {
@@ -212,9 +247,51 @@ public sealed class TimelineCanvas : Control
         e.Handled = true;
     }
 
+    protected override void OnPointerMoved(PointerEventArgs e)
+    {
+        base.OnPointerMoved(e);
+        if (!_isRangeSelecting)
+        {
+            if (_dragStartPoint is not null && _dragStartHit is not null)
+            {
+                var bounds = new Rect(Bounds.Size);
+                var rows = (Items ?? Array.Empty<object>()).OfType<TimelineRow>().ToList();
+                var lanes = ResolveLanes(rows);
+                _dragCurrentHit = HitTestTimeline(bounds, lanes, e.GetPosition(this), StartTick, 1, TimelineHitButton.Left);
+                InvalidateVisual();
+                e.Handled = true;
+            }
+
+            return;
+        }
+
+        _rangeSelectionCurrentPoint = e.GetPosition(this);
+        InvalidateVisual();
+        e.Handled = true;
+    }
+
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
         base.OnPointerReleased(e);
+
+        if (_isRangeSelecting)
+        {
+            var selectionStartPoint = _rangeSelectionStartPoint;
+            var selectionEndPoint = e.GetPosition(this);
+            _isRangeSelecting = false;
+            _rangeSelectionStartPoint = null;
+            _rangeSelectionCurrentPoint = null;
+            e.Pointer.Capture(null);
+
+            if (selectionStartPoint is not null)
+            {
+                RaiseRangeSelected(selectionStartPoint.Value, selectionEndPoint);
+            }
+
+            InvalidateVisual();
+            e.Handled = true;
+            return;
+        }
 
         if (_dragStartPoint is null || _dragStartHit is null)
         {
@@ -225,7 +302,9 @@ public sealed class TimelineCanvas : Control
         var startHit = _dragStartHit;
         _dragStartPoint = null;
         _dragStartHit = null;
+        _dragCurrentHit = null;
         e.Pointer.Capture(null);
+        InvalidateVisual();
 
         var endPoint = e.GetPosition(this);
         if (Math.Abs(endPoint.X - startPoint.X) < 4 && Math.Abs(endPoint.Y - startPoint.Y) < 4)
@@ -272,6 +351,7 @@ public sealed class TimelineCanvas : Control
             var key when IsWhiteKey(key) => Brushes.White,
             var key when IsBlueKey(key) => new SolidColorBrush(Color.Parse("#dbeafe")),
             "speed" or "scroll" or "bpm" or "stop" or "measure" => new SolidColorBrush(Color.Parse("#f7f7d5")),
+            "bga" or "layer" or "poor" => new SolidColorBrush(Color.Parse("#dcfce7")),
             var value when value.StartsWith("background", StringComparison.OrdinalIgnoreCase) => new SolidColorBrush(Color.Parse("#fff7ed")),
             _ => Brushes.White
         };
@@ -365,6 +445,9 @@ public sealed class TimelineCanvas : Control
             "bpm" => "BPM",
             "stop" => "STOP",
             "measure" => "LEN",
+            "bga" => "BGA",
+            "layer" => "LAYER",
+            "poor" => "POOR",
             "scratch" => "S",
             "scratch2" => "S2",
             var key when TryGetKeyNumber(key, out var number) => number.ToString(CultureInfo.InvariantCulture),
@@ -380,7 +463,8 @@ public sealed class TimelineCanvas : Control
         IReadOnlyList<string> lanes,
         int startTick,
         int selectedTick,
-        string selectedLane)
+        string selectedLane,
+        IReadOnlySet<string> selectedObjectKeys)
     {
         if (rows.Count == 0)
         {
@@ -396,13 +480,20 @@ public sealed class TimelineCanvas : Control
                 continue;
             }
 
+            var isSelected = IsSelected(row, selectedTick, selectedLane) || selectedObjectKeys.Contains(CreateObjectKey(row));
             if (row.Kind.Equals("Timing", StringComparison.OrdinalIgnoreCase))
             {
                 if (!row.Detail.Equals("Bar", StringComparison.OrdinalIgnoreCase))
                 {
-                    DrawTimingEvent(context, bounds, lanes, laneWidth, row, y, selectedTick, selectedLane);
+                    DrawTimingEvent(context, bounds, lanes, laneWidth, row, y, isSelected);
                 }
 
+                continue;
+            }
+
+            if (row.Kind.Equals("Visual", StringComparison.OrdinalIgnoreCase))
+            {
+                DrawVisualEvent(context, bounds, lanes, laneWidth, row, y, isSelected);
                 continue;
             }
 
@@ -426,10 +517,42 @@ public sealed class TimelineCanvas : Control
                 context.DrawRectangle(brush, pen, rect);
             }
 
-            if (IsSelected(row, selectedTick, selectedLane))
+            if (isSelected)
             {
                 context.DrawRectangle(null, new Pen(new SolidColorBrush(Color.Parse("#facc15")), 2), rect.Inflate(2));
             }
+        }
+    }
+
+    private static void DrawVisualEvent(
+        DrawingContext context,
+        Rect bounds,
+        IReadOnlyList<string> lanes,
+        double laneWidth,
+        TimelineRow row,
+        double y,
+        bool isSelected)
+    {
+        var laneIndex = FindLaneIndex(lanes, row.Lane);
+        if (laneIndex < 0)
+        {
+            return;
+        }
+
+        var x = ResolveLaneX(bounds, lanes, laneWidth, laneIndex) + 3;
+        var rect = new Rect(x, Math.Round(y - 14), Math.Max(10, laneWidth - 6), 14);
+        var brush = row.Lane switch
+        {
+            "layer" => new SolidColorBrush(Color.Parse("#22c55e")),
+            "poor" => new SolidColorBrush(Color.Parse("#f87171")),
+            _ => new SolidColorBrush(Color.Parse("#16a34a"))
+        };
+        var pen = new Pen(new SolidColorBrush(Color.Parse("#14532d")), 1.2);
+        context.DrawRectangle(brush, pen, rect);
+
+        if (isSelected)
+        {
+            context.DrawRectangle(null, new Pen(new SolidColorBrush(Color.Parse("#facc15")), 2), rect.Inflate(2));
         }
     }
 
@@ -440,8 +563,7 @@ public sealed class TimelineCanvas : Control
         double laneWidth,
         TimelineRow row,
         double y,
-        int selectedTick,
-        string selectedLane)
+        bool isSelected)
     {
         var laneIndex = FindLaneIndex(lanes, ResolveTimingLane(row.Detail));
         if (laneIndex < 0)
@@ -455,7 +577,7 @@ public sealed class TimelineCanvas : Control
         var pen = new Pen(new SolidColorBrush(Color.Parse("#312e81")), 1.2);
         context.DrawRectangle(brush, pen, rect);
 
-        if (IsSelected(row, selectedTick, selectedLane))
+        if (isSelected)
         {
             context.DrawRectangle(null, new Pen(new SolidColorBrush(Color.Parse("#facc15")), 2), rect.Inflate(2));
         }
@@ -466,6 +588,143 @@ public sealed class TimelineCanvas : Control
         return selectedTick >= 0 &&
                row.Tick == selectedTick &&
                string.Equals(row.Lane, selectedLane, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private IReadOnlySet<string> ResolveSelectedObjectKeySet()
+    {
+        return (SelectedObjectKeys ?? Array.Empty<object>())
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private void DrawDragPreview(
+        DrawingContext context,
+        Rect bounds,
+        IReadOnlyList<TimelineRow> rows,
+        IReadOnlyList<string> lanes,
+        IReadOnlySet<string> selectedObjectKeys)
+    {
+        if (_dragStartHit is not { } startHit || _dragCurrentHit is not { } currentHit)
+        {
+            return;
+        }
+
+        var tickDelta = currentHit.Tick - startHit.Tick;
+        var startLaneIndex = FindLaneIndex(lanes, startHit.Lane);
+        var currentLaneIndex = FindLaneIndex(lanes, currentHit.Lane);
+        if (startLaneIndex < 0 || currentLaneIndex < 0)
+        {
+            return;
+        }
+
+        var laneDelta = currentLaneIndex - startLaneIndex;
+        var targets = rows
+            .Where(row => selectedObjectKeys.Contains(CreateObjectKey(row)))
+            .ToList();
+        if (targets.Count == 0)
+        {
+            targets = rows
+                .Where(row =>
+                    string.Equals(row.Lane, startHit.Lane, StringComparison.OrdinalIgnoreCase) &&
+                    Math.Abs(row.Tick - startHit.Tick) <= Math.Max(1, GridTicks / 2))
+                .OrderBy(row => Math.Abs(row.Tick - startHit.Tick))
+                .Take(1)
+                .ToList();
+        }
+
+        if (targets.Count == 0)
+        {
+            return;
+        }
+
+        var laneWidth = ResolveLaneWidth(bounds, lanes);
+        var fill = new SolidColorBrush(Color.Parse("#fde047"), 0.36);
+        var pen = new Pen(new SolidColorBrush(Color.Parse("#a16207")), 2);
+        foreach (var row in targets)
+        {
+            var targetTick = Math.Max(0, row.Tick + tickDelta);
+            var targetLane = ResolvePreviewLane(row, lanes, laneDelta, currentHit.Lane);
+            var y = EventToY(targetTick, bounds, StartTick);
+            if (y < bounds.Top - 48 || y > bounds.Bottom + 48)
+            {
+                continue;
+            }
+
+            var laneIndex = ResolveLaneIndex(targetLane, row.Kind, lanes);
+            if (laneIndex < 0)
+            {
+                continue;
+            }
+
+            var x = ResolveLaneX(bounds, lanes, laneWidth, laneIndex) + 3;
+            var height = row.DurationTicks is > 0 ? 16 : 14;
+            var rect = new Rect(x, Math.Round(y - height), Math.Max(10, laneWidth - 6), height);
+            context.DrawRectangle(fill, pen, rect);
+        }
+    }
+
+    private static string ResolvePreviewLane(TimelineRow row, IReadOnlyList<string> lanes, int laneDelta, string currentLane)
+    {
+        if (row.Kind.Equals("Timing", StringComparison.OrdinalIgnoreCase))
+        {
+            return row.Lane;
+        }
+
+        if (row.Kind.Equals("Visual", StringComparison.OrdinalIgnoreCase))
+        {
+            return IsMediaLane(currentLane) ? currentLane : row.Lane;
+        }
+
+        if ((row.Kind.Equals("Note", StringComparison.OrdinalIgnoreCase) ||
+             row.Kind.Equals("BGM", StringComparison.OrdinalIgnoreCase)) &&
+            !IsAudioLane(currentLane))
+        {
+            return row.Lane;
+        }
+
+        var rowLaneIndex = FindLaneIndex(lanes, row.Lane);
+        if (rowLaneIndex < 0)
+        {
+            return row.Lane;
+        }
+
+        var targetIndex = Math.Clamp(rowLaneIndex + laneDelta, 0, lanes.Count - 1);
+        return lanes[targetIndex];
+    }
+
+    private static bool IsMediaLane(string lane)
+    {
+        return lane.Equals("bga", StringComparison.OrdinalIgnoreCase) ||
+               lane.Equals("layer", StringComparison.OrdinalIgnoreCase) ||
+               lane.Equals("poor", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAudioLane(string lane)
+    {
+        return lane.StartsWith("background", StringComparison.OrdinalIgnoreCase) ||
+               lane.Equals("scratch", StringComparison.OrdinalIgnoreCase) ||
+               lane.Equals("scratch2", StringComparison.OrdinalIgnoreCase) ||
+               TryGetKeyNumber(lane, out _);
+    }
+
+    private static string CreateObjectKey(TimelineRow row)
+    {
+        return $"{row.Kind}|{row.Tick}|{row.Lane}|{row.Detail}";
+    }
+
+    private void DrawRangeSelection(DrawingContext context)
+    {
+        if (!_isRangeSelecting ||
+            _rangeSelectionStartPoint is not { } start ||
+            _rangeSelectionCurrentPoint is not { } current)
+        {
+            return;
+        }
+
+        var rect = new Rect(start, current).Normalize();
+        var fill = new SolidColorBrush(Color.Parse("#60a5fa"), 0.16);
+        var pen = new Pen(new SolidColorBrush(Color.Parse("#2563eb")), 1.2);
+        context.DrawRectangle(fill, pen, rect);
     }
 
     private static void DrawLongNote(
@@ -656,6 +915,31 @@ public sealed class TimelineCanvas : Control
         return new TimelineHitEventArgs(tick, lanes[laneIndex], clickCount, button);
     }
 
+    private void RaiseRangeSelected(Point startPoint, Point endPoint)
+    {
+        var bounds = new Rect(Bounds.Size);
+        var rows = (Items ?? Array.Empty<object>()).OfType<TimelineRow>().ToList();
+        var lanes = ResolveLanes(rows);
+        var laneWidth = ResolveLaneWidth(bounds, lanes);
+        var startLaneIndex = ResolveLaneIndexAtX(bounds, lanes, laneWidth, startPoint.X);
+        var endLaneIndex = ResolveLaneIndexAtX(bounds, lanes, laneWidth, endPoint.X);
+        if (startLaneIndex < 0 || endLaneIndex < 0)
+        {
+            return;
+        }
+
+        var tickA = Math.Max(0, (int)Math.Round(YToTick(startPoint.Y, bounds, StartTick)));
+        var tickB = Math.Max(0, (int)Math.Round(YToTick(endPoint.Y, bounds, StartTick)));
+        var minLaneIndex = Math.Min(startLaneIndex, endLaneIndex);
+        var maxLaneIndex = Math.Max(startLaneIndex, endLaneIndex);
+        TimelineRangeSelected?.Invoke(this, new TimelineRangeSelectionEventArgs(
+            Math.Min(tickA, tickB),
+            Math.Max(tickA, tickB),
+            lanes[minLaneIndex],
+            lanes[maxLaneIndex],
+            lanes.Skip(minLaneIndex).Take(maxLaneIndex - minLaneIndex + 1).ToArray()));
+    }
+
     private static int ResolveLaneIndexAtX(
         Rect bounds,
         IReadOnlyList<string> lanes,
@@ -691,6 +975,12 @@ public sealed class TimelineCanvas : Control
         {
             var eventIndex = FindLaneIndex(lanes, "speed");
             return eventIndex >= 0 ? eventIndex : Math.Min(lanes.Count - 1, Math.Max(1, lanes.Count / 2));
+        }
+
+        if (kind.Equals("Visual", StringComparison.OrdinalIgnoreCase))
+        {
+            var visualIndex = FindLaneIndex(lanes, lane);
+            return visualIndex >= 0 ? visualIndex : FindLaneIndex(lanes, "bga");
         }
 
         var index = FindLaneIndex(lanes, lane);
@@ -809,6 +1099,20 @@ public sealed class TimelineDragEventArgs(int fromTick, string fromLane, int toT
     public string FromLane { get; } = fromLane;
     public int ToTick { get; } = toTick;
     public string ToLane { get; } = toLane;
+}
+
+public sealed class TimelineRangeSelectionEventArgs(
+    int startTick,
+    int endTick,
+    string startLane,
+    string endLane,
+    IReadOnlyList<string> lanes) : EventArgs
+{
+    public int StartTick { get; } = startTick;
+    public int EndTick { get; } = endTick;
+    public string StartLane { get; } = startLane;
+    public string EndLane { get; } = endLane;
+    public IReadOnlyList<string> Lanes { get; } = lanes;
 }
 
 public enum TimelineHitButton

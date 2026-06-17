@@ -51,7 +51,10 @@ public sealed class AudioRow
     public override string ToString()
     {
         var codec = string.IsNullOrWhiteSpace(Codec) ? "unknown" : Codec;
-        return $"{AudioId} / {codec} / {Path}";
+        var metadata = DurationMs > 0 || SampleRate > 0 || Channels > 0
+            ? $" / {DurationMs}ms / {SampleRate}Hz / {Channels}ch"
+            : "";
+        return $"{AudioId} / {codec}{metadata} / {Path}";
     }
 }
 
@@ -93,18 +96,32 @@ public sealed class MediaAssetRow
     public override string ToString()
     {
         var type = string.IsNullOrWhiteSpace(Type) ? "unknown" : Type;
-        return $"{MediaId} / {type} / {Path}";
+        var size = Width is > 0 && Height is > 0 ? $" / {Width}x{Height}" : "";
+        var duration = DurationMs is > 0 ? $" / {DurationMs}ms" : "";
+        return $"{MediaId} / {type}{size}{duration} / {Path}";
     }
 }
+
+public sealed record MediaPreviewData(
+    string MediaId,
+    string Type,
+    string MimeType,
+    string Path,
+    byte[] Bytes);
 
 public sealed class IssueRow
 {
     public string Severity { get; set; } = "";
+    public string Code { get; set; } = "";
     public string Source { get; set; } = "";
+    public string TargetReference { get; set; } = "";
     public string Message { get; set; } = "";
     public string ReferenceType { get; set; } = "";
     public int? Index { get; set; }
+    public int? TargetTick { get; set; }
+    public string TargetLane { get; set; } = "";
     public string AudioId { get; set; } = "";
+    public string AssetId { get; set; } = "";
 }
 
 public sealed class TimelineRow

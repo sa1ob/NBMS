@@ -2,6 +2,7 @@ using System.IO.Compression;
 using NBMS.Core.Import;
 using NBMS.Core.Models;
 using NBMS.Core.Services;
+using NBMS.Studio.App.Services;
 
 namespace NBMS.Studio.App.Import;
 
@@ -17,7 +18,7 @@ public sealed class BmsConversionService
         BmsConversionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        var importResult = await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken);
+        var importResult = await _importService.ImportAsync(bmsPath, options?.EncodingName, cancellationToken);
         var outputRoot = Path.GetFullPath(outputDirectory);
         var scoreDirectory = Path.Combine(outputRoot, "score");
         Directory.CreateDirectory(scoreDirectory);
@@ -34,7 +35,8 @@ public sealed class BmsConversionService
             bmsPath,
             importResult,
             new Dictionary<string, string>(StringComparer.Ordinal),
-            new Dictionary<string, string>(StringComparer.Ordinal));
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            []);
         var audioSources = BuildMergedAudioSources([imported]);
         var mediaSources = BuildMergedMediaSources([imported]);
         RemapChartAudioIds(importResult.Chart, imported.AudioIdMap);
@@ -53,7 +55,10 @@ public sealed class BmsConversionService
         importResult.Header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
         await NbmsJson.WriteAsync(headerPath, importResult.Header, cancellationToken);
 
-        return new BmsConversionResult(headerPath, chartPath, audioPath);
+        return new BmsConversionResult(headerPath, chartPath, audioPath)
+        {
+            ImportReport = imported.ImportReport.ToList()
+        };
     }
 
     public async Task<BmsFolderConversionResult> ConvertFolderAsync(
@@ -82,7 +87,8 @@ public sealed class BmsConversionService
                 bmsPath,
                 await _importService.ImportAsync(bmsPath, options?.EncodingName, cancellationToken),
                 new Dictionary<string, string>(StringComparer.Ordinal),
-                new Dictionary<string, string>(StringComparer.Ordinal)));
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                []));
         }
 
         var header = BuildMergedHeader(sourceRoot, importedFiles);
@@ -126,7 +132,10 @@ public sealed class BmsConversionService
                 HashAlgorithm = "sha256-compact-canonical-json"
             });
 
-            results.Add(new BmsConversionResult(headerPath, chartPath, audioPath));
+            results.Add(new BmsConversionResult(headerPath, chartPath, audioPath)
+            {
+                ImportReport = imported.ImportReport.ToList()
+            });
         }
 
         header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
@@ -158,7 +167,8 @@ public sealed class BmsConversionService
                 bmsPath,
                 await _importService.ImportAsync(bmsPath, cancellationToken: cancellationToken),
                 new Dictionary<string, string>(StringComparer.Ordinal),
-                new Dictionary<string, string>(StringComparer.Ordinal)));
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                []));
         }
 
         var commonTitle = ResolveCommonTitle(importedFiles);
@@ -212,6 +222,7 @@ public sealed class BmsConversionService
     {
         var sources = new List<AudioSource>();
         var usedAudioIds = new Dictionary<string, string>(StringComparer.Ordinal);
+        var audioIdsBySourcePath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var imported in importedFiles)
         {
@@ -222,7 +233,7 @@ public sealed class BmsConversionService
             {
                 var originalAudioId = CreateAudioId(pair.Key, pair.Value);
                 var sourcePath = Path.GetFullPath(Path.Combine(bmsDirectory, pair.Value));
-                var audioId = ResolveMergedAudioId(originalAudioId, sourcePath, usedAudioIds);
+                var audioId = ResolveMergedAudioId(originalAudioId, sourcePath, usedAudioIds, audioIdsBySourcePath);
 
                 imported.AudioIdMap[originalAudioId] = audioId;
                 if (sources.Any(source => source.AudioId.Equals(audioId, StringComparison.Ordinal)))
@@ -235,6 +246,45 @@ public sealed class BmsConversionService
         }
 
         return sources;
+    }
+
+    private static string ResolveMergedAudioId(
+        string originalAudioId,
+        string sourcePath,
+        Dictionary<string, string> usedAudioIds,
+        Dictionary<string, string> audioIdsBySourcePath)
+    {
+        if (audioIdsBySourcePath.TryGetValue(sourcePath, out var existingAudioId))
+        {
+            return existingAudioId;
+        }
+
+        if (!usedAudioIds.TryGetValue(originalAudioId, out var existingPath))
+        {
+            usedAudioIds[originalAudioId] = sourcePath;
+            audioIdsBySourcePath[sourcePath] = originalAudioId;
+            return originalAudioId;
+        }
+
+        if (string.Equals(existingPath, sourcePath, StringComparison.OrdinalIgnoreCase))
+        {
+            audioIdsBySourcePath[sourcePath] = originalAudioId;
+            return originalAudioId;
+        }
+
+        var suffix = StableShortHash(sourcePath);
+        var candidate = $"{originalAudioId}_{suffix}";
+        var index = 2;
+        while (usedAudioIds.TryGetValue(candidate, out var collisionPath) &&
+               !string.Equals(collisionPath, sourcePath, StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = $"{originalAudioId}_{suffix}_{index}";
+            index++;
+        }
+
+        usedAudioIds[candidate] = sourcePath;
+        audioIdsBySourcePath[sourcePath] = candidate;
+        return candidate;
     }
 
     private static string ResolveMergedAudioId(string originalAudioId, string sourcePath, Dictionary<string, string> usedAudioIds)
@@ -277,7 +327,8 @@ public sealed class BmsConversionService
             foreach (var pair in imported.ImportResult.MediaFiles.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
                 var originalMediaId = pair.Key;
-                var sourcePath = Path.GetFullPath(Path.Combine(bmsDirectory, pair.Value));
+                var resolved = BmsMediaAlternativeResolver.Resolve(bmsDirectory, pair.Value);
+                var sourcePath = resolved.SourcePath;
                 var mediaId = ResolveMergedAudioId(originalMediaId, sourcePath, usedMediaIds);
 
                 imported.MediaIdMap[originalMediaId] = mediaId;
@@ -286,7 +337,12 @@ public sealed class BmsConversionService
                     continue;
                 }
 
-                sources.Add(new MediaSource(mediaId, sourcePath, pair.Value));
+                if (resolved.IsAlternative)
+                {
+                    imported.ImportReport.Add($"media alternative resolved: {pair.Value} -> {resolved.RelativePath}");
+                }
+
+                sources.Add(new MediaSource(mediaId, sourcePath, resolved.RelativePath));
             }
         }
 
@@ -354,6 +410,7 @@ public sealed class BmsConversionService
         {
             var archivePath = $"audio/{source.AudioId}{Path.GetExtension(source.OriginalFileName).ToLowerInvariant()}";
             var codec = DetectCodec(source.OriginalFileName);
+            var metadata = AudioMetadataReader.TryRead(source.SourcePath);
 
             if (File.Exists(source.SourcePath))
             {
@@ -367,9 +424,9 @@ public sealed class BmsConversionService
                 Codec = codec,
                 Hash = File.Exists(source.SourcePath) ? await ComputeFileSha256Async(source.SourcePath, cancellationToken) : "",
                 RightsId = "converted-bms-audio",
-                SampleRate = 0,
-                Channels = 0,
-                DurationMs = 0,
+                SampleRate = metadata?.SampleRate ?? 0,
+                Channels = metadata?.Channels ?? 0,
+                DurationMs = metadata?.DurationMs ?? 0,
                 Encrypted = false
             });
         }
@@ -421,6 +478,7 @@ public sealed class BmsConversionService
         {
             var extension = Path.GetExtension(source.OriginalFileName).ToLowerInvariant();
             var archivePath = $"media/{source.MediaId}{extension}";
+            var metadata = MediaMetadataReader.TryRead(source.SourcePath);
 
             if (File.Exists(source.SourcePath))
             {
@@ -434,6 +492,9 @@ public sealed class BmsConversionService
                 Type = DetectMediaType(source.OriginalFileName),
                 MimeType = DetectMediaMimeType(source.OriginalFileName),
                 Hash = File.Exists(source.SourcePath) ? await ComputeFileSha256Async(source.SourcePath, cancellationToken) : "",
+                Width = metadata.Width,
+                Height = metadata.Height,
+                DurationMs = metadata.DurationMs,
                 RightsId = "converted-bms-media"
             });
         }
@@ -644,14 +705,19 @@ public sealed class BmsConversionService
         string BmsPath,
         BmsImportResult ImportResult,
         Dictionary<string, string> AudioIdMap,
-        Dictionary<string, string> MediaIdMap);
+        Dictionary<string, string> MediaIdMap,
+        List<string> ImportReport);
 
     private sealed record AudioSource(string AudioId, string SourcePath, string OriginalFileName);
 
     private sealed record MediaSource(string MediaId, string SourcePath, string OriginalFileName);
+
 }
 
-public sealed record BmsConversionResult(string HeaderPath, string ChartPath, string AudioPath);
+public sealed record BmsConversionResult(string HeaderPath, string ChartPath, string AudioPath)
+{
+    public IReadOnlyList<string> ImportReport { get; init; } = [];
+}
 
 public sealed record BmsFolderConversionResult(IReadOnlyList<BmsConversionResult> Results);
 
@@ -661,7 +727,7 @@ public sealed record BmsFolderConversionOptions(
     string EncodingName,
     bool ReadableScoreJson = false);
 
-public sealed record BmsConversionOptions(bool ReadableScoreJson = false);
+public sealed record BmsConversionOptions(bool ReadableScoreJson = false, string EncodingName = "auto");
 
 public sealed record BmsFolderConversionPreview(
     string SourceDirectory,

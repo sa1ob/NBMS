@@ -75,6 +75,45 @@ public sealed class PlaybackTimelineMap
         return previous.Tick + (next.Tick - previous.Tick) * ratio;
     }
 
+    public double EstimateSecondsAt(double tick)
+    {
+        if (Points.Count == 0)
+        {
+            return 0;
+        }
+
+        var orderedByTick = Points
+            .OrderBy(point => point.Tick)
+            .ThenBy(point => point.TimeSeconds)
+            .ToList();
+        if (tick <= orderedByTick[0].Tick)
+        {
+            return orderedByTick[0].TimeSeconds;
+        }
+
+        for (var index = 0; index < orderedByTick.Count - 1; index++)
+        {
+            var previous = orderedByTick[index];
+            var next = orderedByTick[index + 1];
+            if (tick > next.Tick)
+            {
+                continue;
+            }
+
+            var tickSpan = next.Tick - previous.Tick;
+            if (tickSpan <= 0)
+            {
+                return next.TimeSeconds;
+            }
+
+            var ratio = Math.Clamp((tick - previous.Tick) / tickSpan, 0, 1);
+            return previous.TimeSeconds + (next.TimeSeconds - previous.TimeSeconds) * ratio;
+        }
+
+        var tail = orderedByTick[^1];
+        return tail.TimeSeconds + Math.Max(0, tick - tail.Tick) / TailTicksPerSecond;
+    }
+
     private bool HasStopAt(int tick, double timeSeconds)
     {
         return _stopPoints.Contains((tick, ToTimeKey(timeSeconds)));

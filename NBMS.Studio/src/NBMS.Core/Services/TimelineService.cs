@@ -56,6 +56,18 @@ public sealed class TimelineService
             });
         }
 
+        foreach (var mediaEvent in chart.MediaEvents)
+        {
+            items.Add(new TimelineItem
+            {
+                Tick = mediaEvent.Tick,
+                TimeSeconds = TickToSeconds(mediaEvent.Tick, segments, stopDurations),
+                Kind = "Visual",
+                Lane = ResolveVisualLane(mediaEvent),
+                Detail = $"{mediaEvent.Type} {mediaEvent.MediaId}",
+            });
+        }
+
         return items.OrderBy(item => item.TimeSeconds).ThenBy(item => item.Tick).ToList();
     }
 
@@ -170,6 +182,22 @@ public sealed class TimelineService
             "speed" => "speed",
             _ => ""
         };
+    }
+
+    private static string ResolveVisualLane(MediaEvent mediaEvent)
+    {
+        if (mediaEvent.Type.Equals("poor", StringComparison.OrdinalIgnoreCase))
+        {
+            return "poor";
+        }
+
+        if (mediaEvent.Type.Equals("layer", StringComparison.OrdinalIgnoreCase) ||
+            mediaEvent.Layer is > 0)
+        {
+            return "layer";
+        }
+
+        return "bga";
     }
 
     private readonly record struct BpmSegment(int Tick, double StartSeconds, double SecondsPerTick);

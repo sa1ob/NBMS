@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text.Json;
 using NBMS.Core.Models;
 
@@ -113,6 +114,62 @@ public sealed class MediaArchiveService
         await WriteManifestAsync(mediaArchivePath, manifest, cancellationToken);
     }
 
+    public async Task RenameMediaEntryArchivePathAsync(
+        string mediaArchivePath,
+        MediaManifest manifest,
+        MediaAssetEntry entry,
+        string newMediaId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureArchive(mediaArchivePath);
+        var oldPath = entry.Path.Replace('\\', '/');
+        var extension = Path.GetExtension(oldPath);
+        var newPath = EnsureUniqueArchivePath(mediaArchivePath, $"media/{SanitizeId(newMediaId)}{extension}");
+        if (!string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
+        {
+            await MoveArchiveEntryAsync(mediaArchivePath, oldPath, newPath, cancellationToken);
+            entry.Path = newPath;
+        }
+
+        await WriteManifestAsync(mediaArchivePath, manifest, cancellationToken);
+    }
+
+    public async Task<List<ArchiveIntegrityIssue>> ValidateArchiveEntriesAsync(
+        string mediaArchivePath,
+        MediaManifest manifest,
+        CancellationToken cancellationToken = default)
+    {
+        var issues = new List<ArchiveIntegrityIssue>();
+        await using var stream = File.OpenRead(mediaArchivePath);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
+        foreach (var entry in manifest.Entries)
+        {
+            var path = entry.Path.Replace('\\', '/');
+            var archiveEntry = archive.GetEntry(path);
+            if (archiveEntry is null)
+            {
+                issues.Add(new ArchiveIntegrityIssue("Error", entry.MediaId, path, $"missing archive entry: {path}"));
+                continue;
+            }
+
+            try
+            {
+                var actualHash = await ComputeArchiveEntrySha256Async(archiveEntry, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(entry.Hash) &&
+                    !string.Equals(entry.Hash, actualHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    issues.Add(new ArchiveIntegrityIssue("Error", entry.MediaId, path, $"hash mismatch: {entry.Hash} != {actualHash}"));
+                }
+            }
+            catch (Exception ex)
+            {
+                issues.Add(new ArchiveIntegrityIssue("Error", entry.MediaId, path, $"broken archive entry: {ex.Message}"));
+            }
+        }
+
+        return issues;
+    }
+
     private static void EnsureArchive(string mediaArchivePath)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(mediaArchivePath))!);
@@ -149,6 +206,38 @@ public sealed class MediaArchiveService
                 return candidate;
             }
         }
+    }
+
+    private static async Task MoveArchiveEntryAsync(
+        string archivePath,
+        string oldPath,
+        string newPath,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = File.Open(archivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false);
+        var oldEntry = archive.GetEntry(oldPath);
+        if (oldEntry is null)
+        {
+            return;
+        }
+
+        archive.GetEntry(newPath)?.Delete();
+        var newEntry = archive.CreateEntry(newPath, CompressionLevel.Optimal);
+        await using (var oldStream = oldEntry.Open())
+        await using (var newStream = newEntry.Open())
+        {
+            await oldStream.CopyToAsync(newStream, cancellationToken);
+        }
+
+        oldEntry.Delete();
+    }
+
+    private static async Task<string> ComputeArchiveEntrySha256Async(ZipArchiveEntry entry, CancellationToken cancellationToken)
+    {
+        await using var stream = entry.Open();
+        var hash = await SHA256.HashDataAsync(stream, cancellationToken);
+        return "sha256-" + Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     private static string EnsureUniqueMediaId(MediaManifest manifest, string preferredId)

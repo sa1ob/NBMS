@@ -14,9 +14,11 @@ public sealed class ViewerAudioPlayer : IDisposable
     private readonly List<IDisposable> _activeSources = [];
     private readonly Dictionary<string, PreloadedAudioClip> _preloadedClips = new(StringComparer.Ordinal);
     private readonly object _gate = new();
+    private readonly ViewerAudioSettings _settings;
 
-    public ViewerAudioPlayer()
+    public ViewerAudioPlayer(ViewerAudioSettings settings)
     {
+        _settings = settings;
         _mixer = new MixingSampleProvider(_mixFormat)
         {
             ReadFully = true
@@ -25,7 +27,7 @@ public sealed class ViewerAudioPlayer : IDisposable
         {
             DesiredLatency = 60
         };
-        _output.Init(new SimpleLimiterSampleProvider(_mixer).ToWaveProvider());
+        _output.Init(new SimpleLimiterSampleProvider(_mixer, _settings.MasterGain, _settings.LimiterThreshold).ToWaveProvider());
         _output.Play();
     }
 
@@ -116,7 +118,7 @@ public sealed class ViewerAudioPlayer : IDisposable
     {
         var volume = new VolumeSampleProvider(sample)
         {
-            Volume = 0.28f
+            Volume = _settings.AudioVolume
         };
         ISampleProvider scheduled = volume;
         var safeDelay = Math.Max(0, delaySeconds);
@@ -136,20 +138,28 @@ public sealed class ViewerAudioPlayer : IDisposable
         _mixer.AddMixerInput(scheduled);
     }
 
-    public void StopAll()
+    public void StopActiveSounds()
     {
         List<IDisposable> sources;
         lock (_gate)
         {
             sources = _activeSources.ToList();
             _activeSources.Clear();
-            _preloadedClips.Clear();
         }
 
         _mixer.RemoveAllMixerInputs();
         foreach (var source in sources)
         {
             source.Dispose();
+        }
+    }
+
+    public void StopAll()
+    {
+        StopActiveSounds();
+        lock (_gate)
+        {
+            _preloadedClips.Clear();
         }
     }
 
@@ -275,6 +285,8 @@ internal sealed class PreloadedSampleProvider : ISampleProvider, IDisposable
 
 internal readonly record struct PreloadedAudioClip(float[] Samples, WaveFormat WaveFormat);
 
+public readonly record struct ViewerAudioSettings(float AudioVolume, float MasterGain, float LimiterThreshold);
+
 internal sealed class AutoDisposeSampleProvider : ISampleProvider, IDisposable
 {
     private readonly ISampleProvider _source;
@@ -380,15 +392,17 @@ internal sealed class StereoFromMultiChannelSampleProvider : ISampleProvider
 
 internal sealed class SimpleLimiterSampleProvider : ISampleProvider
 {
-    private const float MasterGain = 0.82f;
-    private const float Threshold = 0.90f;
     private const float Release = 0.0015f;
     private readonly ISampleProvider _source;
+    private readonly float _masterGain;
+    private readonly float _threshold;
     private float _gain = 1f;
 
-    public SimpleLimiterSampleProvider(ISampleProvider source)
+    public SimpleLimiterSampleProvider(ISampleProvider source, float masterGain, float threshold)
     {
         _source = source;
+        _masterGain = Math.Clamp(masterGain, 0f, 2f);
+        _threshold = Math.Clamp(threshold, 0.1f, 1f);
     }
 
     public WaveFormat WaveFormat => _source.WaveFormat;
@@ -399,9 +413,9 @@ internal sealed class SimpleLimiterSampleProvider : ISampleProvider
         for (var i = 0; i < read; i++)
         {
             var index = offset + i;
-            var value = buffer[index] * MasterGain;
+            var value = buffer[index] * _masterGain;
             var absolute = MathF.Abs(value);
-            var targetGain = absolute > Threshold ? Threshold / absolute : 1f;
+            var targetGain = absolute > _threshold ? _threshold / absolute : 1f;
             if (targetGain < _gain)
             {
                 _gain = targetGain;
@@ -411,7 +425,7 @@ internal sealed class SimpleLimiterSampleProvider : ISampleProvider
                 _gain = Math.Min(1f, _gain + Release);
             }
 
-            buffer[index] = Math.Clamp(value * _gain, -Threshold, Threshold);
+            buffer[index] = Math.Clamp(value * _gain, -_threshold, _threshold);
         }
 
         return read;

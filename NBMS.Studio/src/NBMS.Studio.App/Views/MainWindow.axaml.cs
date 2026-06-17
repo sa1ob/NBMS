@@ -1,10 +1,13 @@
 using System.Globalization;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Media.Imaging;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using NBMS.Studio.App.Controls;
 using NBMS.Studio.App.Import;
 using NBMS.Studio.App.ViewModels;
@@ -20,6 +23,7 @@ public sealed partial class MainWindow : Window
     private bool _pendingScrollEditorTimelineToMeasureZero;
     private int? _pendingEditorTimelineTargetTick;
     private int _editorTimelineScrollRequestId;
+    private bool _monoGameContextMenuExtended;
 
     public MainWindow()
     {
@@ -27,7 +31,49 @@ public sealed partial class MainWindow : Window
         DataContext = _viewModel;
         EditorTimelineCanvas.TimelineHit += EditorTimelineCanvas_TimelineHit;
         EditorTimelineCanvas.TimelineDragCompleted += EditorTimelineCanvas_TimelineDragCompleted;
+        EditorTimelineCanvas.TimelineRangeSelected += EditorTimelineCanvas_TimelineRangeSelected;
         KeyDown += MainWindow_KeyDown;
+        Loaded += (_, _) => ExtendMonoGameViewerContextMenu();
+    }
+
+    private void ExtendMonoGameViewerContextMenu()
+    {
+        if (_monoGameContextMenuExtended)
+        {
+            return;
+        }
+
+        var monoGameButton = this.GetVisualDescendants()
+            .OfType<Button>()
+            .FirstOrDefault(button => string.Equals(button.Content?.ToString(), "MonoGame(Viewer)", StringComparison.Ordinal));
+        if (monoGameButton is null)
+        {
+            return;
+        }
+
+        monoGameButton.ContextMenu ??= new ContextMenu();
+        var ffmpegItem = new MenuItem
+        {
+            Header = "Show ffmpeg status"
+        };
+        var videoLeadItem = new MenuItem
+        {
+            Header = "Set video lead ms..."
+        };
+        var audioItem = new MenuItem
+        {
+            Header = "Set audio options..."
+        };
+
+        ffmpegItem.Click += ShowFfmpegStatus_Click;
+        videoLeadItem.Click += SetVideoLeadMs_Click;
+        audioItem.Click += SetMonoGameAudioOptions_Click;
+
+        monoGameButton.ContextMenu.Items.Add(ffmpegItem);
+        monoGameButton.ContextMenu.Items.Add(videoLeadItem);
+        monoGameButton.ContextMenu.Items.Add(audioItem);
+
+        _monoGameContextMenuExtended = true;
     }
 
     private async void OpenNbms_Click(object? sender, RoutedEventArgs e)
@@ -137,6 +183,65 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void EditSelectedEvent_Click(object? sender, RoutedEventArgs e)
+    {
+        if (_viewModel.IsSelectedEventTiming)
+        {
+            var draft = _viewModel.CreateSelectedTimingEventEditDraft();
+            if (draft is null)
+            {
+                return;
+            }
+
+            var input = await ShowTimingEventEditDialogAsync(draft);
+            if (input is not null)
+            {
+                _viewModel.ApplySelectedTimingEventEdit(input.Value, input.DurationTicks);
+            }
+
+            return;
+        }
+
+        if (_viewModel.IsSelectedEventMedia)
+        {
+            var draft = _viewModel.CreateSelectedMediaEventEditDraft();
+            if (draft is null)
+            {
+                return;
+            }
+
+            var input = await ShowMediaEventEditDialogAsync(draft);
+            if (input is not null)
+            {
+                _viewModel.ApplySelectedMediaEventEdit(input.MediaId, input.Type, input.Layer);
+            }
+        }
+    }
+
+    private void DeleteSelectedEvent_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.DeleteSelectedEvent();
+    }
+
+    private async void GridSettings_Click(object? sender, RoutedEventArgs e)
+    {
+        var settings = await ShowGridSettingsDialogAsync();
+        if (settings is not null)
+        {
+            _viewModel.ApplyEditorGridSettings(settings.Division, settings.SnapEnabled);
+        }
+    }
+
+    private void ApplyInspector_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.ApplyInspectorEdits();
+    }
+
+    private void DeleteInspector_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.DeleteInspectorTarget();
+    }
+
     private void EditorTimelineScrollViewer_Loaded(object? sender, RoutedEventArgs e)
     {
         QueueScrollEditorTimelineToMeasureZero();
@@ -188,6 +293,11 @@ public sealed partial class MainWindow : Window
         _viewModel.MoveSelectedTimelineObject(e.FromTick, e.FromLane, e.ToTick, e.ToLane);
     }
 
+    private void EditorTimelineCanvas_TimelineRangeSelected(object? sender, TimelineRangeSelectionEventArgs e)
+    {
+        _viewModel.SelectTimelineObjectsInRange(e.StartTick, e.EndTick, e.Lanes);
+    }
+
     private void AddNote_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.AddDraftNote();
@@ -233,9 +343,41 @@ public sealed partial class MainWindow : Window
         _viewModel.SetSelectedNoteInvisible();
     }
 
-    private void RepairSelectedMissingAudioReference_Click(object? sender, RoutedEventArgs e)
+    private async void RepairSelectedMissingAudioReference_Click(object? sender, RoutedEventArgs e)
     {
-        _viewModel.RepairSelectedMissingAudioReference();
+        var candidates = _viewModel.GetSelectedMissingAudioRepairCandidates();
+        if (candidates.Count == 0)
+        {
+            _viewModel.RepairSelectedMissingAudioReference();
+            return;
+        }
+
+        var selected = await ShowAudioRepairCandidateDialogAsync(candidates);
+        if (selected is null)
+        {
+            return;
+        }
+
+        _viewModel.RepairSelectedMissingAudioReference(selected.AudioId);
+    }
+
+    private void JumpToIssue_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.JumpToSelectedIssue();
+        if (_viewModel.EditorSelectedTick >= 0)
+        {
+            QueueScrollEditorTimelineToTick(_viewModel.EditorSelectedTick);
+        }
+    }
+
+    private async void AutoFixIssue_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.AutoFixSelectedIssueAsync);
+    }
+
+    private async void ValidatePackage_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.ValidatePackageAsync);
     }
 
     private async void PreviewSelectedAudio_Click(object? sender, RoutedEventArgs e)
@@ -287,17 +429,33 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        _viewModel.RenameSelectedAudioAsset(audioId);
+        await RunUiTaskAsync(() => _viewModel.RenameSelectedAudioAssetAsync(audioId));
     }
 
     private async void DeleteAudioAsset_Click(object? sender, RoutedEventArgs e)
     {
+        var selectedAudioIds = AudioAssetListBox.SelectedItems?
+            .OfType<AudioRow>()
+            .Select(row => row.AudioId)
+            .ToList() ?? [];
+
+        if (selectedAudioIds.Count > 1)
+        {
+            await RunUiTaskAsync(() => _viewModel.DeleteAudioAssetsAsync(selectedAudioIds));
+            return;
+        }
+
         await RunUiTaskAsync(_viewModel.DeleteSelectedAudioAssetAsync);
     }
 
     private async void RemoveUnusedAudioAssets_Click(object? sender, RoutedEventArgs e)
     {
         await RunUiTaskAsync(_viewModel.RemoveUnusedAudioAssetsAsync);
+    }
+
+    private async void CheckAudioArchive_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.ValidateAudioArchiveAsync);
     }
 
     private async void AddMediaAsset_Click(object? sender, RoutedEventArgs e)
@@ -344,17 +502,44 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        _viewModel.RenameSelectedMediaAsset(mediaId);
+        await RunUiTaskAsync(() => _viewModel.RenameSelectedMediaAssetAsync(mediaId));
     }
 
     private async void DeleteMediaAsset_Click(object? sender, RoutedEventArgs e)
     {
+        var selectedMediaIds = MediaAssetListBox.SelectedItems?
+            .OfType<MediaAssetRow>()
+            .Select(row => row.MediaId)
+            .ToList() ?? [];
+
+        if (selectedMediaIds.Count > 1)
+        {
+            await RunUiTaskAsync(() => _viewModel.DeleteMediaAssetsAsync(selectedMediaIds));
+            return;
+        }
+
         await RunUiTaskAsync(_viewModel.DeleteSelectedMediaAssetAsync);
     }
 
     private async void RemoveUnusedMediaAssets_Click(object? sender, RoutedEventArgs e)
     {
         await RunUiTaskAsync(_viewModel.RemoveUnusedMediaAssetsAsync);
+    }
+
+    private async void CheckMediaArchive_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.ValidateMediaArchiveAsync);
+    }
+
+    private async void PreviewSelectedMedia_Click(object? sender, RoutedEventArgs e)
+    {
+        var preview = await _viewModel.LoadSelectedMediaPreviewAsync();
+        if (preview is null)
+        {
+            return;
+        }
+
+        await ShowMediaPreviewDialogAsync(preview);
     }
 
     private void Undo_Click(object? sender, RoutedEventArgs e)
@@ -367,6 +552,16 @@ public sealed partial class MainWindow : Window
         _viewModel.RedoEditorCommand();
     }
 
+    private void InsertMeasure_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.InsertMeasureAtSelection();
+    }
+
+    private void DeleteMeasure_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.DeleteMeasureAtSelection();
+    }
+
     private void Copy_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.CopyEditorObject();
@@ -375,6 +570,11 @@ public sealed partial class MainWindow : Window
     private void Paste_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.PasteEditorObject();
+    }
+
+    private void ReplaceSelectedObjectsAudioId_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.ReplaceSelectedObjectsAudioId();
     }
 
     private void MainWindow_KeyDown(object? sender, KeyEventArgs e)
@@ -411,6 +611,16 @@ public sealed partial class MainWindow : Window
         ShowPlaybackWindow();
     }
 
+    private async void PlaybackFromEditorPosition_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.StartPlaybackFromEditorPositionAsync);
+    }
+
+    private async void PlaybackSelectedRange_Click(object? sender, RoutedEventArgs e)
+    {
+        await RunUiTaskAsync(_viewModel.StartSelectedRangePlaybackAsync);
+    }
+
     private void MonoGameViewer_Click(object? sender, RoutedEventArgs e)
     {
         _viewModel.LaunchMonoGameViewer();
@@ -435,6 +645,59 @@ public sealed partial class MainWindow : Window
         if (file?.Path.LocalPath is { Length: > 0 } path)
         {
             _viewModel.SetMonoGameViewerPath(path);
+        }
+    }
+
+    private async void SetFfmpegPath_Click(object? sender, RoutedEventArgs e)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        {
+            Title = "Select ffmpeg.exe",
+            AllowMultiple = false,
+            FileTypeFilter =
+            [
+                new Avalonia.Platform.Storage.FilePickerFileType("ffmpeg")
+                {
+                    Patterns = ["ffmpeg.exe", "*.exe"]
+                }
+            ]
+        });
+
+        var file = files.FirstOrDefault();
+        if (file?.Path.LocalPath is { Length: > 0 } path)
+        {
+            _viewModel.SetFfmpegPath(path);
+        }
+    }
+
+    private void ToggleMonoGameViewerBga_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.ToggleMonoGameViewerBga();
+    }
+
+    private void ShowFfmpegStatus_Click(object? sender, RoutedEventArgs e)
+    {
+        _viewModel.ShowFfmpegDetectionStatus();
+    }
+
+    private async void SetVideoLeadMs_Click(object? sender, RoutedEventArgs e)
+    {
+        var value = await ShowVideoLeadMsDialogAsync(_viewModel.GetMonoGameViewerVideoLeadMs());
+        if (value is { } videoLeadMs)
+        {
+            _viewModel.SetMonoGameViewerVideoLeadMs(videoLeadMs);
+        }
+    }
+
+    private async void SetMonoGameAudioOptions_Click(object? sender, RoutedEventArgs e)
+    {
+        var value = await ShowMonoGameAudioOptionsDialogAsync(_viewModel.GetMonoGameViewerAudioSettings());
+        if (value is { } audioSettings)
+        {
+            _viewModel.SetMonoGameViewerAudioSettings(
+                audioSettings.AudioVolume,
+                audioSettings.MasterGain,
+                audioSettings.LimiterThreshold);
         }
     }
 
@@ -734,6 +997,449 @@ public sealed partial class MainWindow : Window
         return result;
     }
 
+    private async Task<TimingEventInput?> ShowTimingEventEditDialogAsync(MainWindowViewModel.TimingEventEditDraft draft)
+    {
+        var isStop = draft.Type.Equals("stop", StringComparison.OrdinalIgnoreCase);
+        var valueBox = new TextBox
+        {
+            Text = isStop
+                ? (draft.DurationTicks ?? _viewModel.EditorGridTicks).ToString(CultureInfo.InvariantCulture)
+                : (draft.Value ?? 1.0).ToString("0.###", CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var errorText = new TextBlock
+        {
+            Foreground = Brushes.Firebrick,
+            TextWrapping = TextWrapping.Wrap
+        };
+        TimingEventInput? result = null;
+        var okButton = new Button { Content = "Apply", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        var dialog = new Window
+        {
+            Title = $"Edit {draft.Type.ToUpperInvariant()} Event",
+            Width = 420,
+            Height = 230,
+            MinWidth = 360,
+            MinHeight = 210
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            if (isStop)
+            {
+                if (!int.TryParse(valueBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var durationTicks) ||
+                    durationTicks <= 0)
+                {
+                    errorText.Text = "1以上の整数tickを入力してください。";
+                    return;
+                }
+
+                result = new TimingEventInput(null, durationTicks);
+                dialog.Close();
+                return;
+            }
+
+            if (!double.TryParse(valueBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            {
+                errorText.Text = "数値を入力してください。小数は . を使います。";
+                return;
+            }
+
+            if (draft.Lane.Equals("measure", StringComparison.OrdinalIgnoreCase) && value <= 0)
+            {
+                errorText.Text = "小節長倍率は0より大きい数値を入力してください。";
+                return;
+            }
+
+            result = new TimingEventInput(value, null);
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+
+        dialog.Content = new StackPanel
+        {
+            Margin = new Avalonia.Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = $"tick {draft.Tick} / lane {draft.Lane}",
+                    Foreground = Brushes.DimGray
+                },
+                new TextBlock
+                {
+                    Text = isStop ? "STOP duration ticks" : $"{draft.Type} value",
+                    TextWrapping = TextWrapping.Wrap
+                },
+                valueBox,
+                errorText,
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Spacing = 8,
+                    Children = { cancelButton, okButton }
+                }
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<MediaEventInput?> ShowMediaEventEditDialogAsync(MainWindowViewModel.MediaEventEditDraft draft)
+    {
+        var mediaIdBox = new TextBox { Text = draft.MediaId, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var typeBox = new TextBox { Text = draft.Type, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var layerBox = new TextBox
+        {
+            Text = draft.Layer.ToString(CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var errorText = new TextBlock
+        {
+            Foreground = Brushes.Firebrick,
+            TextWrapping = TextWrapping.Wrap
+        };
+        MediaEventInput? result = null;
+        var okButton = new Button { Content = "Apply", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        var dialog = new Window
+        {
+            Title = "Edit Media Event",
+            Width = 460,
+            Height = 330,
+            MinWidth = 380,
+            MinHeight = 280
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(mediaIdBox.Text))
+            {
+                errorText.Text = "MediaIdを入力してください。";
+                return;
+            }
+
+            if (!int.TryParse(layerBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var layer) ||
+                layer < 0)
+            {
+                errorText.Text = "Layerは0以上の整数で入力してください。";
+                return;
+            }
+
+            result = new MediaEventInput(mediaIdBox.Text.Trim(), typeBox.Text?.Trim() ?? "", layer);
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+
+        dialog.Content = new StackPanel
+        {
+            Margin = new Avalonia.Thickness(16),
+            Spacing = 8,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = $"tick {draft.Tick} / lane {draft.Lane}",
+                    Foreground = Brushes.DimGray
+                },
+                new TextBlock { Text = "MediaId", FontWeight = FontWeight.SemiBold },
+                mediaIdBox,
+                new TextBlock { Text = "Type", FontWeight = FontWeight.SemiBold, Margin = new Avalonia.Thickness(0, 6, 0, 0) },
+                typeBox,
+                new TextBlock { Text = "Layer", FontWeight = FontWeight.SemiBold, Margin = new Avalonia.Thickness(0, 6, 0, 0) },
+                layerBox,
+                errorText,
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Spacing = 8,
+                    Children = { cancelButton, okButton }
+                }
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<GridSettingsInput?> ShowGridSettingsDialogAsync()
+    {
+        var divisionBox = new ComboBox
+        {
+            ItemsSource = _viewModel.EditorGridDivisions,
+            SelectedItem = _viewModel.EditorGridDivision,
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var snapBox = new CheckBox
+        {
+            Content = "Snap to grid",
+            IsChecked = _viewModel.IsEditorSnapEnabled
+        };
+        var okButton = new Button { Content = "OK", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        GridSettingsInput? result = null;
+        var dialog = new Window
+        {
+            Title = "Grid settings",
+            Width = 380,
+            Height = 220,
+            MinWidth = 340,
+            MinHeight = 200,
+            Content = new Grid
+            {
+                Margin = new Avalonia.Thickness(16),
+                RowDefinitions = new RowDefinitions("Auto,Auto,Auto,Auto"),
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "Grid division",
+                        FontWeight = FontWeight.SemiBold
+                    },
+                    BuildDialogRow(1, divisionBox),
+                    BuildDialogRow(2, snapBox),
+                    BuildDialogRow(3, new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8,
+                        Margin = new Avalonia.Thickness(0, 16, 0, 0),
+                        Children = { cancelButton, okButton }
+                    })
+                }
+            }
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            var division = divisionBox.SelectedItem is int selected ? selected : _viewModel.EditorGridDivision;
+            result = new GridSettingsInput(division, snapBox.IsChecked == true);
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<int?> ShowVideoLeadMsDialogAsync(int currentValue)
+    {
+        var valueBox = new TextBox
+        {
+            Text = currentValue.ToString(CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+
+        int? result = null;
+        var cancelButton = new Button { Content = "Cancel" };
+        var okButton = new Button { Content = "OK" };
+        var dialog = new Window
+        {
+            Title = "MonoGame Viewer video lead",
+            Width = 360,
+            Height = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new Grid
+            {
+                RowDefinitions =
+                {
+                    new RowDefinition(GridLength.Auto),
+                    new RowDefinition(GridLength.Auto)
+                },
+                Margin = new Thickness(16),
+                Children =
+                {
+                    BuildDialogRow(0, new StackPanel
+                    {
+                        Spacing = 6,
+                        Children =
+                        {
+                            new TextBlock { Text = "Video lead milliseconds (0-1500)" },
+                            valueBox
+                        }
+                    }),
+                    BuildDialogRow(1, new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8,
+                        Children =
+                        {
+                            cancelButton,
+                            okButton
+                        }
+                    })
+                }
+            }
+        };
+
+        cancelButton.Click += (_, _) => dialog.Close();
+        okButton.Click += (_, _) =>
+        {
+            if (int.TryParse(valueBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            {
+                result = Math.Clamp(parsed, 0, 1500);
+                dialog.Close();
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<MainWindowViewModel.MonoGameViewerAudioSettings?> ShowMonoGameAudioOptionsDialogAsync(
+        MainWindowViewModel.MonoGameViewerAudioSettings currentValue)
+    {
+        var volumeBox = new TextBox
+        {
+            Text = currentValue.AudioVolume.ToString("0.00", CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var gainBox = new TextBox
+        {
+            Text = currentValue.MasterGain.ToString("0.00", CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        var limiterBox = new TextBox
+        {
+            Text = currentValue.LimiterThreshold.ToString("0.00", CultureInfo.InvariantCulture),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+
+        MainWindowViewModel.MonoGameViewerAudioSettings? result = null;
+        var cancelButton = new Button { Content = "Cancel" };
+        var okButton = new Button { Content = "OK" };
+        var dialog = new Window
+        {
+            Title = "MonoGame Viewer audio options",
+            Width = 420,
+            Height = 300,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new Grid
+            {
+                RowDefinitions =
+                {
+                    new RowDefinition(GridLength.Auto),
+                    new RowDefinition(GridLength.Auto)
+                },
+                Margin = new Thickness(16),
+                Children =
+                {
+                    BuildDialogRow(0, new StackPanel
+                    {
+                        Spacing = 8,
+                        Children =
+                        {
+                            new TextBlock { Text = "Audio volume (0.0-2.0)" },
+                            volumeBox,
+                            new TextBlock { Text = "Master gain (0.0-2.0)" },
+                            gainBox,
+                            new TextBlock { Text = "Limiter threshold (0.1-1.0)" },
+                            limiterBox
+                        }
+                    }),
+                    BuildDialogRow(1, new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8,
+                        Margin = new Thickness(0, 12, 0, 0),
+                        Children =
+                        {
+                            cancelButton,
+                            okButton
+                        }
+                    })
+                }
+            }
+        };
+
+        cancelButton.Click += (_, _) => dialog.Close();
+        okButton.Click += (_, _) =>
+        {
+            if (float.TryParse(volumeBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var volume) &&
+                float.TryParse(gainBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var gain) &&
+                float.TryParse(limiterBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var limiter))
+            {
+                result = new MainWindowViewModel.MonoGameViewerAudioSettings(
+                    Math.Clamp(volume, 0f, 2f),
+                    Math.Clamp(gain, 0f, 2f),
+                    Math.Clamp(limiter, 0.1f, 1f));
+                dialog.Close();
+            }
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
+    private async Task<MainWindowViewModel.AudioRepairCandidate?> ShowAudioRepairCandidateDialogAsync(
+        IReadOnlyList<MainWindowViewModel.AudioRepairCandidate> candidates)
+    {
+        var listBox = new ListBox
+        {
+            ItemsSource = candidates,
+            SelectedIndex = 0,
+            Background = Brushes.White,
+            Foreground = Brushes.Black,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch
+        };
+        var okButton = new Button { Content = "Fix", MinWidth = 88 };
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 88 };
+        MainWindowViewModel.AudioRepairCandidate? result = null;
+        var dialog = new Window
+        {
+            Title = "Audio reference repair candidates",
+            Width = 760,
+            Height = 360,
+            MinWidth = 520,
+            MinHeight = 260,
+            Content = new Grid
+            {
+                Margin = new Avalonia.Thickness(16),
+                RowDefinitions = new RowDefinitions("Auto,*,Auto"),
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "参照切れの置換候補を選択してください",
+                        FontWeight = FontWeight.SemiBold
+                    },
+                    BuildDialogRow(1, listBox),
+                    BuildDialogRow(2, new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Spacing = 8,
+                        Margin = new Avalonia.Thickness(0, 12, 0, 0),
+                        Children = { cancelButton, okButton }
+                    })
+                }
+            }
+        };
+
+        okButton.Click += (_, _) =>
+        {
+            result = listBox.SelectedItem as MainWindowViewModel.AudioRepairCandidate;
+            dialog.Close();
+        };
+        cancelButton.Click += (_, _) => dialog.Close();
+        listBox.DoubleTapped += (_, _) =>
+        {
+            result = listBox.SelectedItem as MainWindowViewModel.AudioRepairCandidate;
+            dialog.Close();
+        };
+
+        await dialog.ShowDialog(this);
+        return result;
+    }
+
     private async Task<string?> ShowAudioIdInputDialogAsync(string title, string defaultValue)
     {
         var textBox = new TextBox
@@ -790,6 +1496,88 @@ public sealed partial class MainWindow : Window
     {
         Grid.SetRow(control, row);
         return control;
+    }
+
+    private async Task ShowMediaPreviewDialogAsync(MediaPreviewData preview)
+    {
+        Control body;
+        if (IsImagePreview(preview))
+        {
+            try
+            {
+                using var stream = new MemoryStream(preview.Bytes);
+                var bitmap = new Bitmap(stream);
+                body = new ScrollViewer
+                {
+                    Content = new Image
+                    {
+                        Source = bitmap,
+                        Stretch = Stretch.Uniform,
+                        MaxWidth = 720,
+                        MaxHeight = 520
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                body = new TextBlock
+                {
+                    Text = $"画像プレビューを開けませんでした。\n{ex.Message}",
+                    TextWrapping = TextWrapping.Wrap
+                };
+            }
+        }
+        else
+        {
+            body = new TextBlock
+            {
+                Text = $"動画/非画像メディアです。\nMediaId: {preview.MediaId}\nType: {preview.Type}\nPath: {preview.Path}\nSize: {preview.Bytes.Length:N0} bytes\n\n動画再生プレビューは環境依存が大きいため別途検討対象です。",
+                TextWrapping = TextWrapping.Wrap
+            };
+        }
+
+        var closeButton = new Button
+        {
+            Content = "Close",
+            MinWidth = 88,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var dialog = new Window
+        {
+            Title = $"Media Preview - {preview.MediaId}",
+            Width = 780,
+            Height = 640,
+            MinWidth = 420,
+            MinHeight = 260,
+            Content = new Grid
+            {
+                Margin = new Avalonia.Thickness(16),
+                RowDefinitions = new RowDefinitions("Auto,*,Auto"),
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = $"{preview.MediaId} / {preview.Type} / {preview.Path}",
+                        FontWeight = FontWeight.SemiBold,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    },
+                    BuildDialogRow(1, body),
+                    BuildDialogRow(2, closeButton)
+                }
+            }
+        };
+        closeButton.Click += (_, _) => dialog.Close();
+        await dialog.ShowDialog(this);
+    }
+
+    private static bool IsImagePreview(MediaPreviewData preview)
+    {
+        if (preview.MimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return Path.GetExtension(preview.Path).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".webp";
     }
 
     private async Task RunUiTaskAsync(Func<Task> action)
@@ -901,4 +1689,8 @@ public sealed partial class MainWindow : Window
     }
 
     private sealed record TimingEventInput(double? Value, int? DurationTicks);
+
+    private sealed record MediaEventInput(string MediaId, string Type, int Layer);
+
+    private sealed record GridSettingsInput(int Division, bool SnapEnabled);
 }

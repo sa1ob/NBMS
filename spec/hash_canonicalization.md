@@ -30,9 +30,23 @@ sha256-compact-canonical-json
 11. UTF-8 bytesに対してSHA-256を計算する
 12. `sha256-` prefixつきlowercase hexadecimalとして保存する
 
-## 4. Hash対象
+## 4. Hash種別
 
-hash対象は譜面object全体です。
+NBMSでは用途が異なるhashを分けます。
+
+| hash | algorithm | 用途 |
+| --- | --- | --- |
+| `chartHash` | `sha256-compact-canonical-json` | package整合性、譜面ファイル改変検出。 |
+| `scoreHash` | `sha256-nbms-score-canonical-json` | ランキング/スコア送信用。視覚演出やEditor状態の差を除外する。 |
+| `visualHash` | `sha256-nbms-visual-canonical-json` | BGA/media eventを含めた視覚演出の同一性確認。 |
+| `audioManifestHash` | `sha256-file` またはmanifest canonical hash | `.nbma` の整合性確認。 |
+| `mediaManifestHash` | `sha256-file` またはmanifest canonical hash | `.nbmg` の整合性確認。 |
+
+現行headerの `charts[].hash` は `chartHash` として扱います。
+
+## 5. chartHash対象
+
+`chartHash` の対象は譜面の論理object全体です。ただしEditor/ローカル状態は除外します。
 
 hashに影響するもの:
 
@@ -41,15 +55,42 @@ hashに影響するもの:
 - Lane definitions
 - Background audio events
 - Media events
-- Chart metadata
+- Chart metadata。ただし `metadata.extensions["nbms.editor"]` と、互換情報だけの `bmsCompat` は除外
 
 hashに影響しないもの:
 
 - file indentation
 - CRLF / LF line endings
 - object key order
+- readable-json / compact-json / pretty compact-json の整形差
+- `nbms.editor` のgrid、表示開始tick、選択tabなど
 
-## 5. 実装上の未決定メモ
+## 6. scoreHash対象
+
+`scoreHash` はランキング/スコア送信用で、プレイ結果に影響する情報だけを対象にします。
+
+含めるもの:
+
+- Timing events: `bpm`, `stop`, `bar`, measure length
+- Playable notes: lane, tick, type, duration, longNote mode, mineなど
+- 判定へ影響する拡張: `nbms.longNote`, 展開済み `nbms.random`, 将来の判定系extension
+- playable noteの `audioId`。無音差分を別譜面として扱うため
+
+除外するもの:
+
+- `nbms.editor`
+- `mediaEvents[]` と `nbms.visual`
+- `.nbmg` manifest
+- stagefile/banner/preview
+- `nbms.bmsCompat` や `nbms.longNote.bmsCompat` のような変換根拠のみのmetadata
+
+`nbms.random` は未展開状態を直接hashしません。Importer/Playerが同じseedまたは選択結果から展開した後のchartを `scoreHash` 対象にします。未展開RANDOMを含むchartはランキング非対応、またはrandom branch identifierを別途付けます。
+
+## 7. visualHash対象
+
+`visualHash` は視覚演出の同一性確認用です。`mediaEvents[]`, `nbms.visual`, `.nbmg` manifestのmediaId/path/hash/kind/codecを対象にします。スコアランキングには原則使いません。
+
+## 8. 実装上の未決定メモ
 
 浮動小数点正規化は、`NBMS 1.0` 確定前に複数言語で検証する必要があります。それまでは、譜面file内で不要な小数精度を避けるべきです。
 
@@ -87,9 +128,23 @@ For `NBMS 0.2 compact-json`, chart hash calculation uses the following rules:
 11. Calculate SHA-256 over those UTF-8 bytes.
 12. Store the result as lowercase hexadecimal with the `sha256-` prefix.
 
-## 4. Hash Target
+## 4. Hash Types
 
-The hash target is the whole logical chart object.
+NBMS separates hashes by purpose.
+
+| hash | algorithm | purpose |
+| --- | --- | --- |
+| `chartHash` | `sha256-compact-canonical-json` | Package consistency and chart-file tamper detection. |
+| `scoreHash` | `sha256-nbms-score-canonical-json` | Ranking/score submission. Excludes visual effects and editor state. |
+| `visualHash` | `sha256-nbms-visual-canonical-json` | Visual-effect identity including BGA/media events. |
+| `audioManifestHash` | `sha256-file` or manifest canonical hash | `.nbma` consistency. |
+| `mediaManifestHash` | `sha256-file` or manifest canonical hash | `.nbmg` consistency. |
+
+The current header `charts[].hash` is treated as `chartHash`.
+
+## 5. chartHash Target
+
+The `chartHash` target is the whole logical chart object, excluding editor/local state.
 
 The following affect the hash:
 
@@ -98,20 +153,47 @@ The following affect the hash:
 - Lane definitions
 - Background audio events
 - Media events
-- Chart metadata
+- Chart metadata, except `metadata.extensions["nbms.editor"]` and compatibility-only `bmsCompat` data
 
 The following do not affect the hash:
 
 - File indentation
 - CRLF versus LF line endings
 - Object key order
+- readable-json / compact-json / pretty compact-json formatting
+- `nbms.editor` grid, view start tick, selected tab, and similar editor state
 
-## 5. Example Output
+## 6. scoreHash Target
+
+`scoreHash` is for ranking/score submission and includes only gameplay-affecting data.
+
+Included:
+
+- Timing events: `bpm`, `stop`, `bar`, and measure length
+- Playable notes: lane, tick, type, duration, long-note mode, mines, and similar objects
+- Judgement-affecting extensions: `nbms.longNote`, expanded `nbms.random`, and future judgement extensions
+- Playable-note `audioId`, so silent/changed-sound charts can be separated
+
+Excluded:
+
+- `nbms.editor`
+- `mediaEvents[]` and `nbms.visual`
+- `.nbmg` manifest
+- stagefile/banner/preview
+- Conversion-evidence-only metadata such as `nbms.bmsCompat` and `nbms.longNote.bmsCompat`
+
+`nbms.random` is not hashed directly in unresolved form. Importers/players hash the expanded chart produced by the same seed or branch selection. Charts with unresolved RANDOM are either ranking-ineligible or require a separate random branch identifier.
+
+## 7. visualHash Target
+
+`visualHash` checks visual-effect identity. It includes `mediaEvents[]`, `nbms.visual`, and `.nbmg` manifest mediaId/path/hash/kind/codec. It is not used for score rankings by default.
+
+## 8. Example Output
 
 ```text
 sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-## 6. Open Implementation Note
+## 9. Open Implementation Note
 
 The exact treatment of floating-point normalization should be tested across target languages before finalizing `NBMS 1.0`. Until then, authors should avoid unnecessary fractional precision in chart files.

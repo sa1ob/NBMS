@@ -20,11 +20,14 @@ public sealed class ViewerGame : Game
     private const float JudgeLineOffset = 92f;
     private const float PixelsPerSecondBase = 420f;
     private const float StatusScale = 2f;
+    private const double VideoPreloadLeadSeconds = 3.0;
+    private const double VideoSeekToleranceSeconds = 0.05;
 
     private readonly ViewerOptions _options;
     private readonly GraphicsDeviceManager _graphics;
     private readonly NbmsProjectService _projectService = new();
     private readonly TimelineService _timelineService;
+    private readonly IVideoBgaDecoderFactory _videoDecoderFactory;
     private SpriteBatch? _spriteBatch;
     private Texture2D? _pixel;
     private NbmsHeader? _header;
@@ -45,6 +48,12 @@ public sealed class ViewerGame : Game
     private readonly Stopwatch _playbackClock = new();
     private KeyboardState _previousKeyboardState;
     private double _playbackSeconds;
+    private double _startOffsetSeconds;
+    private double? _rangeEndSeconds;
+    private double _lastQueuedAudioEndSeconds;
+    private double _spaceHeldSeconds;
+    private bool _spaceRestartTriggered;
+    private bool _playbackClockFrozen;
     private int _nextAudioIndex;
     private int _nextMediaIndex;
     private int _nextHitIndex;
@@ -52,10 +61,14 @@ public sealed class ViewerGame : Game
     private float _hiSpeed = 1.5f;
     private bool _isLogVisible;
     private BgaPlayfieldSide _bgaPlayfieldSide = BgaPlayfieldSide.OneP;
-    private Texture2D? _currentBgaTexture;
-    private string? _currentBgaVideoId;
-    private FfmpegVideoDecoder? _videoDecoder;
+    private readonly SortedDictionary<int, Texture2D> _currentBgaTexturesByLayer = [];
+    private readonly SortedDictionary<int, string> _currentBgaVideoIdsByLayer = [];
+    private IVideoBgaDecoder? _videoDecoder;
+    private IVideoBgaDecoder? _preloadedVideoDecoder;
+    private string? _preloadedVideoPath;
+    private double _currentVideoStartSeconds;
     private Texture2D? _videoTexture;
+    private byte[]? _videoFrameBuffer;
     private string? _mediaTempDirectory;
     private FpsLimitMode _fpsLimitMode = FpsLimitMode.Unlimited;
     private double _fpsSampleSeconds;
@@ -66,6 +79,7 @@ public sealed class ViewerGame : Game
     public ViewerGame(ViewerOptions options)
     {
         _options = options;
+        _videoDecoderFactory = new CompositeVideoBgaDecoderFactory(options.FfmpegPath);
         _timelineService = new TimelineService(_projectService.ExtensionRegistry);
         _graphics = new GraphicsDeviceManager(this)
         {
@@ -78,6 +92,7 @@ public sealed class ViewerGame : Game
         Window.Title = "NBMS MonoGame Viewer";
         Content.RootDirectory = "Content";
         IsMouseVisible = true;
+        AppendViewerLog($"ViewerGame options videoLead={_options.VideoLeadSeconds:0.000}s");
     }
 
     protected override void Dispose(bool disposing)
@@ -92,6 +107,7 @@ public sealed class ViewerGame : Game
             }
 
             _videoDecoder?.Dispose();
+            _preloadedVideoDecoder?.Dispose();
             _videoTexture?.Dispose();
             DeleteMediaTempDirectory();
         }
@@ -144,6 +160,8 @@ public sealed class ViewerGame : Game
             _hiSpeed = 3.0f;
         }
 
+        UpdateSpaceRestartGesture(keyboard, gameTime);
+
         if (IsPressed(keyboard, Keys.D7))
         {
             CycleFpsLimitMode();
@@ -166,12 +184,69 @@ public sealed class ViewerGame : Game
             }
         }
 
-        _playbackSeconds = _playbackClock.Elapsed.TotalSeconds;
-        QueueUpcomingAudioEvents();
-        ProcessDueMediaEvents();
-        ProcessDueHitEvents();
+        if (!_playbackClockFrozen)
+        {
+            _playbackSeconds = _startOffsetSeconds + _playbackClock.Elapsed.TotalSeconds;
+        }
+
+        if (_rangeEndSeconds is { } rangeEndSeconds && _playbackSeconds >= rangeEndSeconds)
+        {
+            FreezePlaybackClock(rangeEndSeconds, "range end");
+        }
+
+        if (!_playbackClockFrozen)
+        {
+            QueueUpcomingAudioEvents();
+            PreloadUpcomingVideoEvent();
+            ProcessDueMediaEvents();
+            ProcessDueHitEvents();
+            FreezeAtSongEndIfNeeded();
+        }
+
         _previousKeyboardState = keyboard;
         base.Update(gameTime);
+    }
+
+    private void UpdateSpaceRestartGesture(KeyboardState keyboard, GameTime gameTime)
+    {
+        if (!keyboard.IsKeyDown(Keys.Space))
+        {
+            _spaceHeldSeconds = 0;
+            _spaceRestartTriggered = false;
+            return;
+        }
+
+        _spaceHeldSeconds += gameTime.ElapsedGameTime.TotalSeconds;
+        if (!_spaceRestartTriggered && _spaceHeldSeconds >= 0.35)
+        {
+            _spaceRestartTriggered = true;
+            RestartPlaybackFromBeginning();
+        }
+    }
+
+    private void RestartPlaybackFromBeginning()
+    {
+        _audioPlayer?.StopActiveSounds();
+        _startOffsetSeconds = 0;
+        _rangeEndSeconds = null;
+        _playbackSeconds = 0;
+        _lastQueuedAudioEndSeconds = 0;
+        _playbackClockFrozen = false;
+        _playbackClock.Restart();
+        _nextAudioIndex = 0;
+        _nextMediaIndex = 0;
+        _nextHitIndex = _audioSchedule.FindIndex(item => item.IsObject);
+        if (_nextHitIndex < 0)
+        {
+            _nextHitIndex = _audioSchedule.Count;
+        }
+
+        _combo = 0;
+        _currentBgaTexturesByLayer.Clear();
+        _currentBgaVideoIdsByLayer.Clear();
+        StopVideoDecoder();
+        AddLog("restart from head");
+        AppendViewerLog("RestartPlaybackFromBeginning");
     }
 
     protected override void Draw(GameTime gameTime)
@@ -240,7 +315,18 @@ public sealed class ViewerGame : Game
             BuildRenderData(_chart.Chart);
             ApplyPreferredWindowSize(_chart.Reference.Mode);
             LoadAudioBank(header, rootDirectory);
-            LoadMediaBank(header, rootDirectory, _chart.Chart);
+            if (_options.NoBga)
+            {
+                _mediaSchedule = [];
+                AddLog("bga disabled");
+            }
+            else
+            {
+                LoadMediaBank(header, rootDirectory, _chart.Chart);
+                AppendScheduleDiagnostics();
+                RestoreBgaStateAtStartOffset();
+                PreloadInitialVideoEvent();
+            }
             _statusText = $"{header.Title} / {_chart.Reference.Id} / {_chart.Reference.Mode}";
             _statusLines = BuildStatusLines(_statusText, _notes.Count, _measureSeconds.Count);
             AppendViewerLog($"LoadProject ok notes={_notes.Count} measures={_measureSeconds.Count}");
@@ -283,6 +369,8 @@ public sealed class ViewerGame : Game
                 .Concat(bpmEvents.Select(timing => timing.Tick))
                 .Concat(chart.BackgroundAudio.Select(item => item.Tick))
                 .Concat(chart.MediaEvents.Select(item => item.Tick))
+                .Concat(_options.StartTick is { } startTick ? [startTick] : [])
+                .Concat(_options.EndTick is { } endTick ? [endTick] : [])
                 .Concat(measureTicks));
 
         _notes = chart.Notes
@@ -320,15 +408,15 @@ public sealed class ViewerGame : Game
             .ToList();
 
         _mediaSchedule = chart.MediaEvents
-            .Where(item => !string.IsNullOrWhiteSpace(item.MediaId))
             .Select(item => new MediaScheduleItem(
                 secondsByTick[item.Tick],
                 item.Tick,
-                item.MediaId,
-                item.Type,
-                item.Layer ?? 0))
+                item.MediaId ?? "",
+                MediaEventStateResolver.NormalizeType(item.Type),
+                MediaEventStateResolver.ResolveLayer(item.Type, item.Layer)))
             .OrderBy(item => item.TimeSeconds)
-            .ThenBy(item => item.Layer)
+            .ThenBy(item => item.Layer ?? int.MinValue)
+            .ThenBy(item => MediaEventStateResolver.ResolveTypePriority(item.Type))
             .ThenBy(item => item.MediaId, StringComparer.Ordinal)
             .ToList();
 
@@ -342,6 +430,118 @@ public sealed class ViewerGame : Game
             .Select(timing => new BpmMarker(secondsByTick[timing.Tick], timing.Value!.Value))
             .OrderBy(marker => marker.TimeSeconds)
             .ToList();
+
+        ApplyStartTickOffset(secondsByTick);
+    }
+
+    private void AppendScheduleDiagnostics()
+    {
+        var firstAudio = _audioSchedule.FirstOrDefault();
+        var firstMedia = _mediaSchedule.FirstOrDefault();
+        var firstVideo = _mediaSchedule.FirstOrDefault(item => _mediaVideoFiles.ContainsKey(item.MediaId));
+        AppendViewerLog(
+            "Schedule " +
+            $"audio={(firstAudio is null ? "<none>" : $"{firstAudio.Tick}@{firstAudio.TimeSeconds:0.000}")} " +
+            $"media={(firstMedia is null ? "<none>" : $"{firstMedia.Tick}@{firstMedia.TimeSeconds:0.000}:{firstMedia.Type}")} " +
+            $"video={(firstVideo is null ? "<none>" : $"{firstVideo.Tick}@{firstVideo.TimeSeconds:0.000}:{firstVideo.MediaId}")}");
+    }
+
+    private void ApplyStartTickOffset(IReadOnlyDictionary<int, double> secondsByTick)
+    {
+        _startOffsetSeconds = 0;
+        _rangeEndSeconds = null;
+        _lastQueuedAudioEndSeconds = 0;
+        _playbackClockFrozen = false;
+        if (_options.StartTick is not { } startTick || !secondsByTick.TryGetValue(startTick, out var startSeconds))
+        {
+            ApplyRangeEndTick(secondsByTick);
+            return;
+        }
+
+        _startOffsetSeconds = Math.Max(0, startSeconds);
+        _playbackSeconds = _startOffsetSeconds;
+        _lastQueuedAudioEndSeconds = _startOffsetSeconds;
+        _playbackClockFrozen = false;
+        _nextAudioIndex = _audioSchedule.FindIndex(item => item.TimeSeconds >= _startOffsetSeconds);
+        if (_nextAudioIndex < 0)
+        {
+            _nextAudioIndex = _audioSchedule.Count;
+        }
+
+        _nextMediaIndex = _mediaSchedule.FindIndex(item => item.TimeSeconds >= _startOffsetSeconds);
+        if (_nextMediaIndex < 0)
+        {
+            _nextMediaIndex = _mediaSchedule.Count;
+        }
+
+        _nextHitIndex = _audioSchedule.FindIndex(item => item.IsObject && item.TimeSeconds >= _startOffsetSeconds);
+        if (_nextHitIndex < 0)
+        {
+            _nextHitIndex = _audioSchedule.Count;
+        }
+
+        AddLog($"start tick {startTick} => {_startOffsetSeconds:0.000}s");
+        ApplyRangeEndTick(secondsByTick);
+    }
+
+    private void ApplyRangeEndTick(IReadOnlyDictionary<int, double> secondsByTick)
+    {
+        if (_options.EndTick is not { } endTick || !secondsByTick.TryGetValue(endTick, out var endSeconds))
+        {
+            return;
+        }
+
+        _rangeEndSeconds = Math.Max(_startOffsetSeconds + 0.25, endSeconds);
+        AddLog($"end tick {endTick} => {_rangeEndSeconds:0.000}s");
+    }
+
+    private void RestoreBgaStateAtStartOffset()
+    {
+        if (_startOffsetSeconds <= 0 || _mediaSchedule.Count == 0)
+        {
+            return;
+        }
+
+        _currentBgaTexturesByLayer.Clear();
+        _currentBgaVideoIdsByLayer.Clear();
+        StopVideoDecoder();
+
+        MediaScheduleItem? lastVideoEvent = null;
+        var restoredCount = 0;
+        for (var index = 0; index < _mediaSchedule.Count; index++)
+        {
+            var item = _mediaSchedule[index];
+            if (item.TimeSeconds > _startOffsetSeconds)
+            {
+                _nextMediaIndex = index;
+                break;
+            }
+
+            ApplyMediaEvent(item, seekOffsetSeconds: 0, startDecoder: false, writeLog: false);
+            restoredCount++;
+            if (!item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrWhiteSpace(item.MediaId) &&
+                _mediaVideoFiles.ContainsKey(item.MediaId))
+            {
+                lastVideoEvent = item;
+            }
+        }
+
+        if (restoredCount == _mediaSchedule.Count)
+        {
+            _nextMediaIndex = _mediaSchedule.Count;
+        }
+
+        if (lastVideoEvent is not null &&
+            _currentBgaVideoIdsByLayer.ContainsKey(lastVideoEvent.Layer ?? 0) &&
+            _mediaVideoFiles.TryGetValue(lastVideoEvent.MediaId, out var videoPath))
+        {
+            var seekOffsetSeconds = Math.Max(0, _startOffsetSeconds - lastVideoEvent.TimeSeconds);
+            _currentVideoStartSeconds = lastVideoEvent.TimeSeconds;
+            PlayVideo(videoPath, seekOffsetSeconds);
+        }
+
+        AddLog($"bga restored events={restoredCount} next={_nextMediaIndex}");
     }
 
     private void LoadAudioBank(NbmsHeader header, string rootDirectory)
@@ -353,9 +553,13 @@ public sealed class ViewerGame : Game
                 header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
             var requiredAudioIds = _audioSchedule.Select(item => item.AudioId).Distinct(StringComparer.Ordinal);
             _audioBank = ViewerAudioBank.Load(audioPath, requiredAudioIds);
-            _audioPlayer = new ViewerAudioPlayer();
+            var audioSettings = new ViewerAudioSettings(
+                _options.AudioVolume,
+                _options.MasterGain,
+                _options.LimiterThreshold);
+            _audioPlayer = new ViewerAudioPlayer(audioSettings);
             var preloaded = _audioPlayer.Preload(_audioBank.Files);
-            AddLog($"audio ready {_audioBank.Count} preload={preloaded}");
+            AddLog($"audio ready {_audioBank.Count} preload={preloaded} vol={audioSettings.AudioVolume:0.00} gain={audioSettings.MasterGain:0.00} limit={audioSettings.LimiterThreshold:0.00}");
         }
         catch (Exception ex)
         {
@@ -376,6 +580,8 @@ public sealed class ViewerGame : Game
                 _audioPlayer is not null &&
                 _audioBank.TryGetFilePath(item.AudioId, out var filePath))
             {
+                var durationSeconds = _audioBank.ResolveDurationSeconds(item.AudioId);
+                _lastQueuedAudioEndSeconds = Math.Max(_lastQueuedAudioEndSeconds, item.TimeSeconds + Math.Max(0.05, durationSeconds));
                 if (!_audioPlayer.PlayPreloadedOneShot(item.AudioId, delaySeconds))
                 {
                     _audioPlayer.PlayOneShot(filePath, delaySeconds);
@@ -396,33 +602,165 @@ public sealed class ViewerGame : Game
                _mediaSchedule[_nextMediaIndex].TimeSeconds <= _playbackSeconds)
         {
             var item = _mediaSchedule[_nextMediaIndex++];
-            if (item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase))
+            var seekOffsetSeconds = Math.Max(0, _playbackSeconds - item.TimeSeconds);
+            ApplyMediaEvent(item, seekOffsetSeconds);
+        }
+    }
+
+    private void PreloadUpcomingVideoEvent()
+    {
+        if (_preloadedVideoDecoder is not null || _videoDecoder is not null)
+        {
+            return;
+        }
+
+        var item = _mediaSchedule
+            .Skip(_nextMediaIndex)
+            .FirstOrDefault(item =>
+                !item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase) &&
+                _mediaVideoFiles.ContainsKey(item.MediaId) &&
+                item.TimeSeconds > _playbackSeconds &&
+                item.TimeSeconds <= _playbackSeconds + VideoPreloadLeadSeconds);
+        if (item is null)
+        {
+            return;
+        }
+
+        TryPreloadVideoEvent(item, writeUserLog: true);
+    }
+
+    private void PreloadInitialVideoEvent()
+    {
+        if (_preloadedVideoDecoder is not null || _videoDecoder is not null)
+        {
+            return;
+        }
+
+        var item = _mediaSchedule
+            .Skip(_nextMediaIndex)
+            .FirstOrDefault(item =>
+                !item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase) &&
+                _mediaVideoFiles.ContainsKey(item.MediaId) &&
+                item.TimeSeconds >= _startOffsetSeconds &&
+                item.TimeSeconds <= _startOffsetSeconds + VideoPreloadLeadSeconds);
+        if (item is null)
+        {
+            return;
+        }
+
+        TryPreloadVideoEvent(item, writeUserLog: false);
+    }
+
+    private void TryPreloadVideoEvent(MediaScheduleItem item, bool writeUserLog)
+    {
+        if (!_mediaVideoFiles.TryGetValue(item.MediaId, out var videoPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var decoder = _videoDecoderFactory.Open(videoPath, startOffset: null, startPaused: true);
+            if (!decoder.SupportsPlaybackControl)
             {
-                _currentBgaTexture = null;
-                _currentBgaVideoId = null;
-                StopVideoDecoder();
-                AddLog("bga clear");
-                continue;
+                decoder.Dispose();
+                return;
             }
 
-            if (_mediaVideoFiles.TryGetValue(item.MediaId, out var videoPath))
+            _preloadedVideoDecoder = decoder;
+            _preloadedVideoPath = videoPath;
+            AppendViewerLog(
+                $"Video preloaded decoder={decoder.GetType().Name} media={item.MediaId} " +
+                $"tick={item.Tick} sec={item.TimeSeconds:0.000} path={videoPath}");
+            if (writeUserLog)
             {
-                _currentBgaTexture = null;
-                _currentBgaVideoId = item.MediaId;
-                PlayVideo(videoPath);
-                AddLog($"bga video {item.MediaId}");
+                AddLog($"video preloaded {item.MediaId}");
             }
-            else if (_mediaTextures.TryGetValue(item.MediaId, out var texture))
+        }
+        catch (Exception ex)
+        {
+            AddLog($"video preload failed {ex.GetType().Name}");
+            AppendViewerLog($"PreloadUpcomingVideoEvent failed {ex}");
+        }
+    }
+
+    private void ApplyMediaEvent(
+        MediaScheduleItem item,
+        double seekOffsetSeconds,
+        bool startDecoder = true,
+        bool writeLog = true)
+    {
+        if (item.Type.Equals("clear", StringComparison.OrdinalIgnoreCase))
+        {
+            if (item.Layer is { } layer)
             {
-                _currentBgaTexture = texture;
-                _currentBgaVideoId = null;
-                StopVideoDecoder();
-                AddLog($"bga {item.MediaId}");
+                _currentBgaTexturesByLayer.Remove(layer);
+                _currentBgaVideoIdsByLayer.Remove(layer);
+                if (_currentBgaVideoIdsByLayer.Count == 0)
+                {
+                    StopVideoDecoder();
+                }
+
+                if (writeLog)
+                {
+                    AddLog($"bga clear L{layer}");
+                }
             }
             else
             {
-                AddLog($"bga missing {item.MediaId}");
+                _currentBgaTexturesByLayer.Clear();
+                _currentBgaVideoIdsByLayer.Clear();
+                StopVideoDecoder();
+                if (writeLog)
+                {
+                    AddLog("bga clear");
+                }
             }
+
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(item.MediaId))
+        {
+            return;
+        }
+
+        var layerIndex = item.Layer ?? 0;
+        if (_mediaVideoFiles.TryGetValue(item.MediaId, out var videoPath))
+        {
+            _currentBgaTexturesByLayer.Remove(layerIndex);
+            _currentBgaVideoIdsByLayer[layerIndex] = item.MediaId;
+            if (startDecoder)
+            {
+                _currentVideoStartSeconds = item.TimeSeconds;
+                AppendViewerLog(
+                    $"Media due video media={item.MediaId} tick={item.Tick} " +
+                    $"eventSec={item.TimeSeconds:0.000} playback={_playbackSeconds:0.000} off={seekOffsetSeconds:0.000}");
+                PlayVideo(videoPath, seekOffsetSeconds);
+            }
+
+            if (writeLog)
+            {
+                AddLog($"bga video L{layerIndex} {item.MediaId} off={seekOffsetSeconds:0.000}s");
+            }
+        }
+        else if (_mediaTextures.TryGetValue(item.MediaId, out var texture))
+        {
+            _currentBgaVideoIdsByLayer.Remove(layerIndex);
+            _currentBgaTexturesByLayer[layerIndex] = texture;
+            if (_currentBgaVideoIdsByLayer.Count == 0)
+            {
+                StopVideoDecoder();
+            }
+
+            if (writeLog)
+            {
+                AddLog($"bga L{layerIndex} {item.MediaId}");
+            }
+        }
+        else if (writeLog)
+        {
+            AddLog($"bga missing {item.MediaId}");
         }
     }
 
@@ -511,7 +849,7 @@ public sealed class ViewerGame : Game
 
     private void DrawBgaBackground()
     {
-        if (_spriteBatch is null || (_currentBgaTexture is null && _currentBgaVideoId is null))
+        if (_spriteBatch is null || (_currentBgaTexturesByLayer.Count == 0 && _currentBgaVideoIdsByLayer.Count == 0))
         {
             return;
         }
@@ -519,31 +857,20 @@ public sealed class ViewerGame : Game
         var viewport = GraphicsDevice.Viewport.Bounds;
         var layout = ResolvePlayfieldLayout(viewport);
         var rects = ResolveBgaRects(viewport, layout);
-        var texture = ResolveCurrentBgaTexture();
-        if (texture is null)
-        {
-            return;
-        }
-
-        if (_currentBgaVideoId is not null)
-        {
-            DrawVideoStatus(rects[0]);
-        }
-
         if (layout.IsDoublePlay)
         {
             foreach (var rect in rects)
             {
-                DrawBgaTexture(texture, rect);
+                DrawBgaLayers(rect);
             }
 
             return;
         }
 
-        DrawBgaTexture(texture, rects[0]);
+        DrawBgaLayers(rects[0]);
     }
 
-    private void DrawBgaTexture(Texture2D texture, Microsoft.Xna.Framework.Rectangle rect)
+    private void DrawBgaLayers(Microsoft.Xna.Framework.Rectangle rect)
     {
         if (_spriteBatch is null)
         {
@@ -551,8 +878,22 @@ public sealed class ViewerGame : Game
         }
 
         DrawRect(rect.X - 2, rect.Y - 2, rect.Width + 4, rect.Height + 4, new Color(18, 22, 30));
-        var fit = FitTexture(texture, rect);
-        _spriteBatch.Draw(texture, fit, Color.White);
+        foreach (var layer in _currentBgaTexturesByLayer.Keys.Concat(_currentBgaVideoIdsByLayer.Keys).Distinct().Order())
+        {
+            var texture = ResolveBgaLayerTexture(layer);
+            if (texture is null)
+            {
+                continue;
+            }
+
+            var fit = FitTexture(texture, rect);
+            _spriteBatch.Draw(texture, fit, Color.White);
+        }
+
+        if (_currentBgaVideoIdsByLayer.Count > 0)
+        {
+            DrawVideoStatus(rect);
+        }
     }
 
     private void LoadMediaBank(NbmsHeader header, string rootDirectory, NbmsChart chart)
@@ -716,6 +1057,39 @@ public sealed class ViewerGame : Game
                 y += 15f;
             }
         }
+    }
+
+    private void FreezeAtSongEndIfNeeded()
+    {
+        if (_playbackClockFrozen || _rangeEndSeconds is not null)
+        {
+            return;
+        }
+
+        if (_nextAudioIndex < _audioSchedule.Count)
+        {
+            return;
+        }
+
+        var stopSeconds = Math.Max(_lastQueuedAudioEndSeconds, _audioSchedule.Count > 0 ? _audioSchedule[^1].TimeSeconds : 0);
+        if (_playbackSeconds >= stopSeconds)
+        {
+            FreezePlaybackClock(stopSeconds, "song end");
+        }
+    }
+
+    private void FreezePlaybackClock(double seconds, string reason)
+    {
+        if (_playbackClockFrozen)
+        {
+            return;
+        }
+
+        _playbackSeconds = Math.Max(0, seconds);
+        _playbackClock.Stop();
+        _playbackClockFrozen = true;
+        AddLog($"freeze {reason} {_playbackSeconds:0.000}s");
+        AppendViewerLog($"FreezePlaybackClock {reason} {_playbackSeconds:0.000}s");
     }
 
     private void DrawCompactInfoPanel(Microsoft.Xna.Framework.Rectangle viewport)
@@ -950,11 +1324,11 @@ public sealed class ViewerGame : Game
         ];
     }
 
-    private Texture2D? ResolveCurrentBgaTexture()
+    private Texture2D? ResolveBgaLayerTexture(int layer)
     {
-        if (_currentBgaVideoId is null)
+        if (!_currentBgaVideoIdsByLayer.ContainsKey(layer))
         {
-            return _currentBgaTexture;
+            return _currentBgaTexturesByLayer.GetValueOrDefault(layer);
         }
 
         if (_videoDecoder is null)
@@ -962,63 +1336,151 @@ public sealed class ViewerGame : Game
             return null;
         }
 
-        var frame = _videoDecoder.TakeLatestFrame();
-        if (frame is not null)
+        var frameSize = _videoDecoder.OutputWidth * _videoDecoder.OutputHeight * 4;
+        if (_videoFrameBuffer is null || _videoFrameBuffer.Length != frameSize)
+        {
+            _videoFrameBuffer = new byte[frameSize];
+        }
+
+        var presentationTime = TimeSpan.FromSeconds(Math.Max(
+            0,
+            _playbackSeconds - _currentVideoStartSeconds + _options.VideoLeadSeconds));
+        if (_videoDecoder.TryCopyFrame(_videoFrameBuffer, presentationTime))
         {
             if (_videoTexture is null ||
-                _videoTexture.Width != FfmpegVideoDecoder.OutputWidth ||
-                _videoTexture.Height != FfmpegVideoDecoder.OutputHeight)
+                _videoTexture.Width != _videoDecoder.OutputWidth ||
+                _videoTexture.Height != _videoDecoder.OutputHeight)
             {
                 _videoTexture?.Dispose();
                 _videoTexture = new Texture2D(
                     GraphicsDevice,
-                    FfmpegVideoDecoder.OutputWidth,
-                    FfmpegVideoDecoder.OutputHeight,
+                    _videoDecoder.OutputWidth,
+                    _videoDecoder.OutputHeight,
                     mipmap: false,
                     SurfaceFormat.Color);
             }
 
-            _videoTexture.SetData(frame);
+            _videoTexture.SetData(_videoFrameBuffer);
         }
 
         return _videoTexture;
     }
 
-    private void PlayVideo(string videoPath)
+    private void PlayVideo(string videoPath, double seekOffsetSeconds = 0)
     {
         try
         {
-            if (_videoDecoder is not null && _videoDecoder.SourcePath.Equals(videoPath, StringComparison.OrdinalIgnoreCase))
+            var effectiveSeekOffsetSeconds = seekOffsetSeconds > VideoSeekToleranceSeconds
+                ? seekOffsetSeconds
+                : 0;
+
+            if (_videoDecoder is not null &&
+                _videoDecoder.SourcePath.Equals(videoPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (effectiveSeekOffsetSeconds > 0 && !_videoDecoder.Seek(TimeSpan.FromSeconds(effectiveSeekOffsetSeconds)))
+                {
+                    StopVideoDecoder();
+                }
+                else
+                {
+                    return;
+                }
+            }
+
+            if (effectiveSeekOffsetSeconds <= 0 &&
+                _videoDecoder is not null)
             {
                 return;
             }
 
-            StopVideoDecoder();
-            _videoDecoder = FfmpegVideoDecoder.Start(videoPath);
+            try
+            {
+                if (_preloadedVideoDecoder is not null &&
+                    string.Equals(_preloadedVideoPath, videoPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    _videoDecoder?.Dispose();
+                    _videoDecoder = null;
+                    _videoDecoder = _preloadedVideoDecoder;
+                    _preloadedVideoDecoder = null;
+                    _preloadedVideoPath = null;
+                    var decoderSeekOffsetSeconds = ResolveDecoderSeekOffsetSeconds(_videoDecoder, effectiveSeekOffsetSeconds);
+                    if (decoderSeekOffsetSeconds > 0)
+                    {
+                        _videoDecoder.Seek(TimeSpan.FromSeconds(decoderSeekOffsetSeconds));
+                    }
+
+                    _videoDecoder.Play();
+                    AddLog($"video preloaded play off={effectiveSeekOffsetSeconds:0.000}s");
+                    AppendViewerLog(
+                        $"PlayVideo promoted decoder={_videoDecoder.GetType().Name} " +
+                        $"running={_videoDecoder.IsRunning} err={_videoDecoder.LastError} " +
+                        $"off={effectiveSeekOffsetSeconds:0.000} seek={decoderSeekOffsetSeconds:0.000} path={videoPath}");
+                }
+                else
+                {
+                    StopVideoDecoder();
+                    _videoDecoder = _videoDecoderFactory.Open(
+                        videoPath,
+                        effectiveSeekOffsetSeconds > 0 ? TimeSpan.FromSeconds(effectiveSeekOffsetSeconds) : null);
+                    var decoderSeekOffsetSeconds = ResolveDecoderSeekOffsetSeconds(_videoDecoder, effectiveSeekOffsetSeconds);
+                    if (decoderSeekOffsetSeconds > effectiveSeekOffsetSeconds)
+                    {
+                        _videoDecoder.Seek(TimeSpan.FromSeconds(decoderSeekOffsetSeconds));
+                    }
+
+                    AppendViewerLog(
+                        $"PlayVideo opened decoder={_videoDecoder.GetType().Name} " +
+                        $"running={_videoDecoder.IsRunning} err={_videoDecoder.LastError} " +
+                        $"off={effectiveSeekOffsetSeconds:0.000} seek={decoderSeekOffsetSeconds:0.000} path={videoPath}");
+                }
+            }
+            catch when (effectiveSeekOffsetSeconds > 0)
+            {
+                AddLog("video seek failed; retry from head");
+                _videoDecoder = _videoDecoderFactory.Open(videoPath);
+                AppendViewerLog(
+                    $"PlayVideo retry decoder={_videoDecoder.GetType().Name} " +
+                    $"running={_videoDecoder.IsRunning} err={_videoDecoder.LastError} path={videoPath}");
+            }
         }
         catch (Exception ex)
         {
-            _currentBgaVideoId = null;
+            _currentBgaVideoIdsByLayer.Clear();
             AddLog($"video failed {ex.GetType().Name}: {ex.Message}");
             AppendViewerLog($"PlayVideo failed {ex}");
         }
+    }
+
+    private double ResolveDecoderSeekOffsetSeconds(IVideoBgaDecoder decoder, double requestedOffsetSeconds)
+    {
+        if (decoder.GetType().Name.Contains("WindowsMedia", StringComparison.OrdinalIgnoreCase))
+        {
+            return requestedOffsetSeconds + _options.VideoLeadSeconds;
+        }
+
+        return requestedOffsetSeconds;
     }
 
     private void StopVideoDecoder()
     {
         _videoDecoder?.Dispose();
         _videoDecoder = null;
+        _preloadedVideoDecoder?.Dispose();
+        _preloadedVideoDecoder = null;
+        _preloadedVideoPath = null;
+        _currentVideoStartSeconds = 0;
+        _videoFrameBuffer = null;
     }
 
     private void DrawVideoStatus(Microsoft.Xna.Framework.Rectangle rect)
     {
-        if (_videoDecoder is null || _videoDecoder.IsRunning)
+        if (_videoDecoder is null || _videoDecoder.IsRunning || string.IsNullOrWhiteSpace(_videoDecoder.LastError))
         {
             return;
         }
 
         DrawRect(rect.X + 8, rect.Y + 8, Math.Min(rect.Width - 16, 360), 34, new Color(10, 14, 22, 220));
-        DrawText("BGA VIDEO STOPPED / CHECK FFMPEG", rect.X + 18, rect.Y + 18, 1.5f, new Color(255, 190, 120));
+        DrawText("BGA VIDEO ERROR / CHECK FFMPEG", rect.X + 18, rect.Y + 18, 1.5f, new Color(255, 190, 120));
     }
 
     private void AddVideoDecoderLog()
@@ -1239,7 +1701,7 @@ public sealed class ViewerGame : Game
 
     private sealed record BpmMarker(double TimeSeconds, double Bpm);
 
-    private sealed record MediaScheduleItem(double TimeSeconds, int Tick, string MediaId, string Type, int Layer);
+    private sealed record MediaScheduleItem(double TimeSeconds, int Tick, string MediaId, string Type, int? Layer);
 
     private sealed record PlayfieldLayout(float Left, float Width, int LaneCount, bool IsDoublePlay);
 

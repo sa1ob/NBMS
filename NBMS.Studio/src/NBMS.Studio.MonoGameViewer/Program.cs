@@ -9,7 +9,7 @@ public static class Program
         {
             AppendStartupLog($"start cwd={Environment.CurrentDirectory} args={string.Join(" ", args.Select(EscapeLogValue))}");
             var options = ViewerOptions.Parse(args);
-            AppendStartupLog($"parsed header={options.HeaderPath ?? "<null>"} chart={options.ChartId ?? "<null>"}");
+            AppendStartupLog($"parsed header={options.HeaderPath ?? "<null>"} chart={options.ChartId ?? "<null>"} startTick={options.StartTick?.ToString() ?? "<null>"} endTick={options.EndTick?.ToString() ?? "<null>"} ffmpeg={options.FfmpegPath ?? "<auto>"} noBga={options.NoBga} videoLead={options.VideoLeadSeconds:0.000}s audioVolume={options.AudioVolume:0.00} masterGain={options.MasterGain:0.00} limiter={options.LimiterThreshold:0.00}");
 
             using var game = new ViewerGame(options);
             AppendStartupLog("game created");
