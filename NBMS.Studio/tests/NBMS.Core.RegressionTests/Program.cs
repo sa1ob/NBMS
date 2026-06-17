@@ -11,6 +11,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("media layer state restore at start tick", TestMediaLayerStateRestoreAsync),
     ("no-bga equivalent skips media state", TestNoBgaEquivalentAsync),
     ("BMS media alternative file search", TestBmsMediaAlternativeSearchAsync),
+    ("BMS audio alternative file search", TestBmsAudioAlternativeSearchAsync),
     ("BMS Shift_JIS charset import", TestShiftJisCharsetImportAsync)
 };
 
@@ -218,6 +219,18 @@ static async Task TestBmsMediaAlternativeSearchAsync()
 
     Assert(intro.IsAlternative && intro.RelativePath == "intro.png", "image alternative resolution should prefer image extensions.");
     Assert(movie.IsAlternative && movie.RelativePath == "movie.mp4", "video alternative resolution should prefer video extensions.");
+}
+
+static async Task TestBmsAudioAlternativeSearchAsync()
+{
+    var directory = CreateTempDirectory();
+    await File.WriteAllBytesAsync(Path.Combine(directory, "alarm1.ogg"), [0x4F, 0x67, 0x67, 0x53]);
+
+    var resolved = BmsAudioAlternativeResolver.Resolve(directory, "alarm1.wav");
+
+    Assert(resolved.IsAlternative, "audio alternative resolution should mark extension fallback.");
+    Assert(resolved.RelativePath == "alarm1.ogg", "audio alternative resolution should find ogg for wav declaration.");
+    Assert(File.Exists(resolved.SourcePath), "audio alternative source path should exist.");
 }
 
 static async Task TestShiftJisCharsetImportAsync()

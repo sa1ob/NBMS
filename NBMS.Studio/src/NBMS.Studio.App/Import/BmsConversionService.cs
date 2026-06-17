@@ -232,7 +232,8 @@ public sealed class BmsConversionService
             foreach (var pair in imported.ImportResult.WavFiles.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
                 var originalAudioId = CreateAudioId(pair.Key, pair.Value);
-                var sourcePath = Path.GetFullPath(Path.Combine(bmsDirectory, pair.Value));
+                var resolved = BmsAudioAlternativeResolver.Resolve(bmsDirectory, pair.Value);
+                var sourcePath = resolved.SourcePath;
                 var audioId = ResolveMergedAudioId(originalAudioId, sourcePath, usedAudioIds, audioIdsBySourcePath);
 
                 imported.AudioIdMap[originalAudioId] = audioId;
@@ -241,7 +242,12 @@ public sealed class BmsConversionService
                     continue;
                 }
 
-                sources.Add(new AudioSource(audioId, sourcePath, pair.Value));
+                if (resolved.IsAlternative)
+                {
+                    imported.ImportReport.Add($"audio alternative resolved: {pair.Value} -> {resolved.RelativePath}");
+                }
+
+                sources.Add(new AudioSource(audioId, sourcePath, resolved.RelativePath));
             }
         }
 
