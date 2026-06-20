@@ -20,6 +20,7 @@
         <Separator />
         <MenuItem Header="保存" Click="Save_Click" />
         <MenuItem Header="配布パッケージを作成..." Click="ExportPackage_Click" />
+        <MenuItem Header="BMS互換出力..." Click="ExportBms_Click" />
         <Separator />
         <MenuItem Header="終了" Click="Exit_Click" />
       </MenuItem>
@@ -159,7 +160,7 @@
                     <Button Content="Apply" Click="ApplyInspector_Click" Margin="0,0,4,0" />
                     <Button Content="Delete" Click="DeleteInspector_Click" Margin="4,0,0,0" />
                   </UniformGrid>
-                  <TextBlock Text="Value/Id is audioId, BPM value, LNOBJ id, or mediaId. Dur/Layer is note duration, STOP duration, or media layer."
+                  <TextBlock Text="Value/Id is audioId, BPM value, or mediaId. Dur/Layer is note duration, STOP duration, or media layer."
                              Foreground="#ffffff"
                              TextWrapping="Wrap" />
                 </StackPanel>
@@ -212,6 +213,16 @@
                           Margin="4,4,0,0" />
                 </UniformGrid>
               </Grid>
+            </TabItem>
+            <TabItem Header="{Binding ImportReportSummaryText}" FontSize="12">
+              <DataGrid ItemsSource="{Binding ImportReportEntries}"
+                        AutoGenerateColumns="False"
+                        IsReadOnly="True">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Chart" Binding="{Binding Chart}" Width="90" />
+                  <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="*" />
+                </DataGrid.Columns>
+              </DataGrid>
             </TabItem>
             <TabItem Header="{Binding AudioSummaryText}" FontSize="12">
               <Grid RowDefinitions="*,Auto,Auto,Auto">
@@ -295,6 +306,7 @@
           <ScrollViewer x:Name="EditorTimelineScrollViewer"
                         Grid.Row="1"
                         Loaded="EditorTimelineScrollViewer_Loaded"
+                        PointerWheelChanged="EditorTimelineScrollViewer_PointerWheelChanged"
                         HorizontalScrollBarVisibility="Disabled"
                         VerticalScrollBarVisibility="Auto">
             <controls:TimelineCanvas x:Name="EditorTimelineCanvas"

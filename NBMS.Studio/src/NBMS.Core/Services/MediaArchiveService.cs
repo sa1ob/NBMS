@@ -59,7 +59,7 @@ public sealed class MediaArchiveService
         await using (var stream = File.Open(mediaArchivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false))
         {
-            var entry = archive.CreateEntry(archivePath, CompressionLevel.Optimal);
+            var entry = archive.CreateEntry(archivePath, ArchiveCompressionPolicy.ForAssetPath(archivePath));
             await using var entryStream = entry.Open();
             await using var sourceStream = File.OpenRead(sourceFilePath);
             await sourceStream.CopyToAsync(entryStream, cancellationToken);
@@ -170,6 +170,44 @@ public sealed class MediaArchiveService
         return issues;
     }
 
+    public async Task ExtractMediaFilesAsync(
+        string mediaArchivePath,
+        MediaManifest manifest,
+        string destinationDirectory,
+        IReadOnlyDictionary<string, string> outputFileNames,
+        CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(destinationDirectory);
+        await using var stream = File.OpenRead(mediaArchivePath);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
+        foreach (var entry in manifest.Entries)
+        {
+            if (!outputFileNames.TryGetValue(entry.MediaId, out var outputFileName) ||
+                string.IsNullOrWhiteSpace(outputFileName))
+            {
+                continue;
+            }
+
+            var archivePath = entry.Path.Replace('\\', '/');
+            var archiveEntry = archive.GetEntry(archivePath);
+            if (archiveEntry is null)
+            {
+                continue;
+            }
+
+            var safeFileName = Path.GetFileName(outputFileName);
+            if (string.IsNullOrWhiteSpace(safeFileName))
+            {
+                continue;
+            }
+
+            var outputPath = Path.Combine(destinationDirectory, safeFileName);
+            await using var input = archiveEntry.Open();
+            await using var output = File.Create(outputPath);
+            await input.CopyToAsync(output, cancellationToken);
+        }
+    }
+
     private static void EnsureArchive(string mediaArchivePath)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(mediaArchivePath))!);
@@ -223,7 +261,7 @@ public sealed class MediaArchiveService
         }
 
         archive.GetEntry(newPath)?.Delete();
-        var newEntry = archive.CreateEntry(newPath, CompressionLevel.Optimal);
+        var newEntry = archive.CreateEntry(newPath, ArchiveCompressionPolicy.ForAssetPath(newPath));
         await using (var oldStream = oldEntry.Open())
         await using (var newStream = newEntry.Open())
         {

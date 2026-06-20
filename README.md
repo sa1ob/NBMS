@@ -66,8 +66,11 @@ BGAも同様の形式に映像コンテナ/メディアコンテナ `.nbmg` と�
 ## ドキュメント
 
 - [NBMS利用ガイド](docs/NBMS_USAGE.md)
+- [公開レビューガイド](docs/NBMS_PUBLIC_REVIEW_GUIDE.md)
 - [NBMSフォーマット仕様ドラフト](docs/NBMS_SPEC.md)
 - [NBMS仕様の未決定事項](docs/NBMS_UNRESOLVED_SPEC.md)
+- [`nbms.editor` 保存情報棚卸し](docs/NBMS_EDITOR_STATE_AUDIT.md)
+- [BMS互換出力とloss report方針](docs/NBMS_BMS_EXPORT_LOSS_REPORT.md)
 
 ## NBMS Studio
 
@@ -157,8 +160,11 @@ This is intended for people who can build it, because it is not complete enough 
 ## Documents
 
 - [NBMS Usage Guide](docs/NBMS_USAGE.md)
+- [Public Review Guide](docs/NBMS_PUBLIC_REVIEW_GUIDE.md)
 - [NBMS Format Specification Draft](docs/NBMS_SPEC.md)
 - [Unresolved NBMS Specification Topics](docs/NBMS_UNRESOLVED_SPEC.md)
+- [`nbms.editor` State Audit](docs/NBMS_EDITOR_STATE_AUDIT.md)
+- [BMS Compatibility Export and Loss Report Policy](docs/NBMS_BMS_EXPORT_LOSS_REPORT.md)
 
 ## NBMS Studio
 

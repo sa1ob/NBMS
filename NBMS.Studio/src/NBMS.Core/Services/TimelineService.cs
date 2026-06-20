@@ -166,7 +166,6 @@ public sealed class TimelineService
             "measureLength" => $"MEASURE {timing.Value ?? 1.0}",
             "stop" => $"STOP {timing.DurationTicks} ticks",
             "speed" => $"SPEED {timing.Value ?? 1.0}",
-            "lnobj" => $"LNOBJ {timing.Event}",
             _ => timing.Type
         };
     }

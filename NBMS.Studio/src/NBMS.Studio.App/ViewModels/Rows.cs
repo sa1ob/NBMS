@@ -124,6 +124,17 @@ public sealed class IssueRow
     public string AssetId { get; set; } = "";
 }
 
+public sealed class ImportReportRow
+{
+    public string Chart { get; set; } = "";
+    public string Message { get; set; } = "";
+
+    public override string ToString()
+    {
+        return string.IsNullOrWhiteSpace(Chart) ? Message : $"{Chart}: {Message}";
+    }
+}
+
 public sealed class TimelineRow
 {
     public int Tick { get; set; }

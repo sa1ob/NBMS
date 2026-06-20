@@ -21,6 +21,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     private readonly AudioArchiveService _audioArchiveService = new();
     private readonly MediaArchiveService _mediaArchiveService = new();
     private readonly BmsConversionService _bmsConversionService = new();
+    private readonly BmsExportService _bmsExportService = new();
     private readonly ReferenceCheckService _referenceCheckService = new();
     private readonly DispatcherTimer _playbackTimer = new()
     {
@@ -115,6 +116,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
     public ObservableCollection<TimelineRow> Timeline { get; } = [];
     public ObservableCollection<MeasureGridLineRow> MeasureGridLines { get; } = [];
     public ObservableCollection<EventRow> Events { get; } = [];
+    public ObservableCollection<ImportReportRow> ImportReportEntries { get; } = [];
     public ObservableCollection<string> Extensions { get; } = [];
     public ObservableCollection<string> EditorSelectedObjectKeys { get; } = [];
     public ObservableCollection<int> EditorGridDivisions { get; } = [4, 8, 12, 16, 24, 32, 48, 64];
@@ -2682,6 +2684,8 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     public string IssueSummaryText => Issues.Count == 0 ? "参照切れなし" : $"{Issues.Count}件の確認事項";
 
+    public string ImportReportSummaryText => $"{ImportReportEntries.Count} import";
+
     public string PlaybackButtonText => IsPlaying ? "再生中" : _playbackOffsetSeconds > 0 ? "再開" : "再生";
 
     public string PlaybackLogButtonText => IsPlaybackLogVisible ? "ログ非表示" : "ログ表示";
@@ -3027,6 +3031,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     public async Task OpenProjectAsync(string headerPath)
     {
+        using var measure = PerformanceLog.Measure($"Studio.OpenProject file={Path.GetFileName(headerPath)}");
         StopPlayback();
         CancelAudioCachePreparation();
         _audioCache?.Dispose();
@@ -3173,14 +3178,15 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             return;
         }
 
+        using var measure = PerformanceLog.Measure($"Studio.SaveProject file={Path.GetFileName(_project.HeaderPath)}");
         ApplyHeaderFields();
         ApplyNoteRows();
         ApplyAudioRows();
         ApplyMediaRows();
         await _projectService.SaveAsync(_project);
 
-        // 保存後はハッシュと参照チェックを再計算するため、開き直して画面を同期する。
-        await OpenProjectAsync(_project.HeaderPath);
+        // 保存後はディスクから全再読み込みせず、現在のViewModel状態から一覧だけ同期する。
+        RefreshCollections();
         StatusText = "保存しました。";
     }
 
@@ -3209,15 +3215,183 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         StatusText = $"配布パッケージを作成しました: {outputPath}";
     }
 
+    public async Task ExportSelectedChartToBmsAsync(string outputPath)
+    {
+        if (_project is null || _selectedChart is null)
+        {
+            StatusText = "BMS互換出力できる譜面が開かれていません。";
+            return;
+        }
+
+        ApplyHeaderFields();
+        ApplyNoteRows();
+        ApplyAudioRows();
+        ApplyMediaRows();
+
+        var audioFileNames = BuildBmsExportAudioFileNames(_project);
+        var mediaFileNames = BuildBmsExportMediaFileNames(_project);
+        var result = _bmsExportService.Export(_project.Header, _selectedChart.Chart, audioFileNames, mediaFileNames);
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        await File.WriteAllTextAsync(outputPath, result.BmsText, System.Text.Encoding.UTF8);
+        if (_project.AudioManifest is not null)
+        {
+            await _audioArchiveService.ExtractAudioFilesAsync(
+                ResolveAudioArchivePath(_project),
+                _project.AudioManifest,
+                Path.GetDirectoryName(outputPath)!,
+                result.AudioFileNames);
+        }
+        if (_project.MediaManifest is not null && _project.Header.Media is not null)
+        {
+            await _mediaArchiveService.ExtractMediaFilesAsync(
+                ResolveMediaArchivePath(_project),
+                _project.MediaManifest,
+                Path.GetDirectoryName(outputPath)!,
+                result.MediaFileNames);
+        }
+
+        var reportPath = Path.Combine(
+            Path.GetDirectoryName(outputPath)!,
+            $"{Path.GetFileNameWithoutExtension(outputPath)}-loss-report.md");
+        await File.WriteAllTextAsync(reportPath, result.LossReportMarkdown, System.Text.Encoding.UTF8);
+
+        StatusText = result.Issues.Count > 0
+            ? $"BMS互換出力完了: {outputPath} / loss report {result.Issues.Count}件"
+            : $"BMS互換出力完了: {outputPath}";
+    }
+
+    private static Dictionary<string, string> BuildBmsExportAudioFileNames(NbmsProject project)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (project.AudioManifest is null)
+        {
+            return result;
+        }
+
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in project.AudioManifest.Entries)
+        {
+            var extension = Path.GetExtension(entry.Path);
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                extension = ResolveBmsExportAudioExtension(entry.Codec);
+            }
+
+            var baseName = SanitizeBmsExportFileName(entry.AudioId);
+            var fileName = EnsureUniqueBmsExportFileName($"{baseName}{extension}", used);
+            result[entry.AudioId] = fileName;
+        }
+
+        return result;
+    }
+
+    private static Dictionary<string, string> BuildBmsExportMediaFileNames(NbmsProject project)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (project.MediaManifest is null)
+        {
+            return result;
+        }
+
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in project.MediaManifest.Entries)
+        {
+            var extension = Path.GetExtension(entry.Path);
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                extension = ResolveBmsExportMediaExtension(entry.MimeType, entry.Type);
+            }
+
+            var baseName = SanitizeBmsExportFileName(entry.MediaId);
+            var fileName = EnsureUniqueBmsExportFileName($"{baseName}{extension}", used);
+            result[entry.MediaId] = fileName;
+        }
+
+        return result;
+    }
+
+    private static string ResolveBmsExportMediaExtension(string mimeType, string type)
+    {
+        var normalizedMime = mimeType.ToLowerInvariant();
+        if (normalizedMime.Contains("png", StringComparison.Ordinal))
+        {
+            return ".png";
+        }
+
+        if (normalizedMime.Contains("jpeg", StringComparison.Ordinal) || normalizedMime.Contains("jpg", StringComparison.Ordinal))
+        {
+            return ".jpg";
+        }
+
+        if (normalizedMime.Contains("gif", StringComparison.Ordinal))
+        {
+            return ".gif";
+        }
+
+        if (normalizedMime.Contains("mpeg", StringComparison.Ordinal))
+        {
+            return ".mpg";
+        }
+
+        if (normalizedMime.Contains("mp4", StringComparison.Ordinal))
+        {
+            return ".mp4";
+        }
+
+        if (normalizedMime.Contains("avi", StringComparison.Ordinal))
+        {
+            return ".avi";
+        }
+
+        return type.Equals("video", StringComparison.OrdinalIgnoreCase) ? ".mpg" : ".bmp";
+    }
+
+    private static string ResolveBmsExportAudioExtension(string codec)
+    {
+        return codec.ToLowerInvariant() switch
+        {
+            "flac" => ".flac",
+            "ogg-vorbis" => ".ogg",
+            "mp3" => ".mp3",
+            _ => ".wav"
+        };
+    }
+
+    private static string SanitizeBmsExportFileName(string value)
+    {
+        var chars = value
+            .Select(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.' ? ch : '_')
+            .ToArray();
+        var result = new string(chars).Trim('_', '.');
+        return string.IsNullOrWhiteSpace(result) ? "audio" : result;
+    }
+
+    private static string EnsureUniqueBmsExportFileName(string fileName, HashSet<string> used)
+    {
+        var candidate = fileName;
+        var baseName = Path.GetFileNameWithoutExtension(fileName);
+        var extension = Path.GetExtension(fileName);
+        var index = 2;
+        while (!used.Add(candidate))
+        {
+            candidate = $"{baseName}_{index}{extension}";
+            index++;
+        }
+
+        return candidate;
+    }
+
     public async Task ConvertBmsAsync(string bmsPath, string outputDirectory)
     {
         StopPlayback();
         StatusText = "BMSをNBMSへ変換しています...";
 
         var result = await _bmsConversionService.ConvertAsync(bmsPath, outputDirectory);
+        ReplaceImportReport([result]);
+        var reportPath = await WriteBmsImportReportAsync(outputDirectory, [result]);
         await OpenProjectAsync(result.HeaderPath);
         StatusText = result.ImportReport.Count > 0
-            ? $"BMS変換完了: {result.HeaderPath} / 代替media解決 {result.ImportReport.Count}件"
+            ? $"BMS変換完了: {result.HeaderPath} / import report {result.ImportReport.Count}件 ({reportPath})"
             : $"BMS変換完了: {result.HeaderPath}";
     }
 
@@ -3237,12 +3411,83 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         var result = await _bmsConversionService.ConvertFolderAsync(bmsDirectory, outputDirectory, options);
         var first = result.Results.FirstOrDefault()
             ?? throw new InvalidDataException("変換対象のBMS譜面がありません。");
+        ReplaceImportReport(result.Results);
+        var reportPath = await WriteBmsImportReportAsync(outputDirectory, result.Results);
 
         await OpenProjectAsync(first.HeaderPath);
         var reportCount = result.Results.Sum(item => item.ImportReport.Count);
         StatusText = reportCount > 0
-            ? $"BMS一括変換完了: {result.Results.Count}件 / 代替media解決 {reportCount}件"
+            ? $"BMS一括変換完了: {result.Results.Count}件 / import report {reportCount}件 ({reportPath})"
             : $"BMS一括変換完了: {result.Results.Count}件";
+    }
+
+    private static async Task<string> WriteBmsImportReportAsync(
+        string outputDirectory,
+        IReadOnlyList<BmsConversionResult> results)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        var reportPath = Path.Combine(outputDirectory, "import-report.md");
+        var lines = new List<string>
+        {
+            "# BMS Import Report",
+            "",
+            $"Generated: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}",
+            ""
+        };
+
+        foreach (var result in results)
+        {
+            lines.Add($"## {Path.GetFileName(result.ChartPath)}");
+            lines.Add("");
+            lines.Add($"- Header: `{result.HeaderPath}`");
+            lines.Add($"- Chart: `{result.ChartPath}`");
+            lines.Add($"- Audio: `{result.AudioPath}`");
+            if (result.ImportReport.Count == 0)
+            {
+                lines.Add("- No import report items.");
+            }
+            else
+            {
+                foreach (var item in result.ImportReport)
+                {
+                    lines.Add($"- {item}");
+                }
+            }
+
+            lines.Add("");
+        }
+
+        await File.WriteAllLinesAsync(reportPath, lines, System.Text.Encoding.UTF8);
+        return reportPath;
+    }
+
+    private void ReplaceImportReport(IReadOnlyList<BmsConversionResult> results)
+    {
+        ImportReportEntries.Clear();
+        foreach (var result in results)
+        {
+            var chartName = Path.GetFileName(result.ChartPath);
+            if (result.ImportReport.Count == 0)
+            {
+                ImportReportEntries.Add(new ImportReportRow
+                {
+                    Chart = chartName,
+                    Message = "No import report items."
+                });
+                continue;
+            }
+
+            foreach (var item in result.ImportReport)
+            {
+                ImportReportEntries.Add(new ImportReportRow
+                {
+                    Chart = chartName,
+                    Message = item
+                });
+            }
+        }
+
+        OnPropertyChanged(nameof(ImportReportSummaryText));
     }
 
     public void SelectChartById(string chartId)
@@ -4773,7 +5018,6 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             "stop" => $"STOP {timing.DurationTicks} ticks",
             "scroll" => $"SCROLL {timing.Value ?? 1.0}",
             "speed" => $"SPEED {timing.Value ?? 1.0}",
-            "lnobj" => $"LNOBJ {timing.Event}",
             _ => timing.Type
         };
     }
@@ -5562,6 +5806,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     private void RefreshCollections()
     {
+        using var measure = PerformanceLog.Measure("Studio.RefreshCollections");
         Charts.Clear();
         AudioEntries.Clear();
         MediaEntries.Clear();
@@ -5686,6 +5931,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
 
     private void RefreshTimelineOnly(bool preserveEditorRange = false)
     {
+        using var measure = PerformanceLog.Measure($"Studio.RefreshTimelineOnly preserve={preserveEditorRange}");
         Timeline.Clear();
         MeasureGridLines.Clear();
         Events.Clear();
@@ -5775,8 +6021,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
                row.Detail.StartsWith("STOP ", StringComparison.Ordinal) ||
                row.Detail.StartsWith("SCROLL ", StringComparison.Ordinal) ||
                row.Detail.StartsWith("SPEED ", StringComparison.Ordinal) ||
-               row.Detail.StartsWith("MEASURE ", StringComparison.Ordinal) ||
-               row.Detail.StartsWith("LNOBJ ", StringComparison.Ordinal);
+               row.Detail.StartsWith("MEASURE ", StringComparison.Ordinal);
     }
 
     private static bool IsLongNoteType(NoteEvent note)
@@ -6712,6 +6957,7 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
         foreach (var loadedChart in _project.Charts)
         {
             AddViewerCompatibilityIssue(loadedChart);
+            AddBmsCompatibilityIssues(loadedChart);
             AddBrokenLongNoteIssues(loadedChart);
             AddOverlapIssues(loadedChart);
             AddHorizontalDuplicationIssues(loadedChart);
@@ -6732,6 +6978,50 @@ public sealed class MainWindowViewModel : ObservableObject, IDisposable
             Source = loadedChart.Reference.Id,
             Message = $"Viewer未対応の可能性があるmode: {loadedChart.Chart.Mode}"
         });
+    }
+
+    private void AddBmsCompatibilityIssues(LoadedChart loadedChart)
+    {
+        if (loadedChart.Chart.Metadata is not { ValueKind: JsonValueKind.Object } metadata ||
+            !metadata.TryGetProperty("bmsCompat", out var bmsCompat) ||
+            bmsCompat.ValueKind != JsonValueKind.Object)
+        {
+            return;
+        }
+
+        if (TryGetBoolean(bmsCompat, "randomPreserved") || TryGetBoolean(bmsCompat, "branchNotExpanded"))
+        {
+            Issues.Add(new IssueRow
+            {
+                Severity = "Warning",
+                Code = "NBMS_RANDOM_PRESERVED",
+                Source = loadedChart.Reference.Id,
+                TargetReference = $"chart:{loadedChart.Reference.Id}:metadata:bmsCompat.randomDirectives",
+                Message = "BMSのRANDOM/IF分岐は互換metadataとして保持しています。現在のEditorでは分岐展開や編集は行いません。"
+            });
+        }
+
+        if (bmsCompat.TryGetProperty("unsupportedDirectives", out var unsupported) &&
+            unsupported.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var directive in unsupported.EnumerateArray().Select(item => item.GetString()).Where(item => !string.IsNullOrWhiteSpace(item)))
+            {
+                Issues.Add(new IssueRow
+                {
+                    Severity = "Warning",
+                    Code = "NBMS_IMPORT_UNSUPPORTED_DIRECTIVE",
+                    Source = loadedChart.Reference.Id,
+                    TargetReference = $"chart:{loadedChart.Reference.Id}:metadata:bmsCompat.unsupportedDirectives",
+                    Message = $"未対応BMS命令をimport reportへ保持しています: {directive}"
+                });
+            }
+        }
+    }
+
+    private static bool TryGetBoolean(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var value) &&
+               value.ValueKind == JsonValueKind.True;
     }
 
     private void AddBrokenLongNoteIssues(LoadedChart loadedChart)

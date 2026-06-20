@@ -188,14 +188,19 @@ public sealed class TimelineCanvas : Control
 
         var rows = (Items ?? Array.Empty<object>()).OfType<TimelineRow>().ToList();
         var lanes = ResolveLanes(rows);
+        var visibleRows = ResolveVisibleRows(rows, bounds, StartTick);
+        var visibleMeasureGridLines = ResolveVisibleMeasureGridLines(
+            (MeasureGridLines ?? Array.Empty<object>()).OfType<MeasureGridLineRow>(),
+            bounds,
+            StartTick);
 
         DrawBackground(context, bounds);
         DrawLaneBackgrounds(context, bounds, lanes);
-        DrawMeasureGrid(context, bounds, StartTick, GridTicks, (MeasureGridLines ?? Array.Empty<object>()).OfType<MeasureGridLineRow>().ToList());
+        DrawMeasureGrid(context, bounds, StartTick, GridTicks, visibleMeasureGridLines);
         DrawLaneSeparators(context, bounds, lanes);
         DrawLaneHeaders(context, bounds, lanes);
         var selectedObjectKeys = ResolveSelectedObjectKeySet();
-        DrawEvents(context, bounds, rows, lanes, StartTick, SelectedTick, SelectedLane, selectedObjectKeys);
+        DrawEvents(context, bounds, visibleRows, lanes, StartTick, SelectedTick, SelectedLane, selectedObjectKeys);
         DrawDragPreview(context, bounds, rows, lanes, selectedObjectKeys);
         DrawStartLine(context, bounds, StartTick);
         DrawRangeSelection(context);
@@ -768,11 +773,6 @@ public sealed class TimelineCanvas : Control
             return new SolidColorBrush(Color.Parse("#84cc16"));
         }
 
-        if (detail.StartsWith("LNOBJ ", StringComparison.OrdinalIgnoreCase))
-        {
-            return new SolidColorBrush(Color.Parse("#a78bfa"));
-        }
-
         return new SolidColorBrush(Color.Parse("#94a3b8"));
     }
 
@@ -881,6 +881,41 @@ public sealed class TimelineCanvas : Control
     private static double EventToY(double tick, Rect bounds, int startTick)
     {
         return bounds.Bottom - TimelineBottomPadding - (tick - startTick) * PixelsPerTick;
+    }
+
+    private static IReadOnlyList<TimelineRow> ResolveVisibleRows(
+        IReadOnlyList<TimelineRow> rows,
+        Rect bounds,
+        int startTick)
+    {
+        if (rows.Count == 0)
+        {
+            return rows;
+        }
+
+        var marginTicks = (int)Math.Ceiling(80 / PixelsPerTick);
+        var minTick = Math.Max(0, startTick - marginTicks);
+        var maxTick = startTick + (int)Math.Ceiling(Math.Max(1, bounds.Height) / PixelsPerTick) + marginTicks;
+        return rows
+            .Where(row =>
+            {
+                var endTick = row.Tick + Math.Max(0, row.DurationTicks ?? 0);
+                return row.Tick <= maxTick && endTick >= minTick;
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyList<MeasureGridLineRow> ResolveVisibleMeasureGridLines(
+        IEnumerable<MeasureGridLineRow> lines,
+        Rect bounds,
+        int startTick)
+    {
+        var marginTicks = (int)Math.Ceiling(20 / PixelsPerTick);
+        var minTick = Math.Max(0, startTick - marginTicks);
+        var maxTick = startTick + (int)Math.Ceiling(Math.Max(1, bounds.Height) / PixelsPerTick) + marginTicks;
+        return lines
+            .Where(line => line.Tick >= minTick && line.Tick <= maxTick)
+            .ToList();
     }
 
     private static double YToTick(double y, Rect bounds, int startTick)

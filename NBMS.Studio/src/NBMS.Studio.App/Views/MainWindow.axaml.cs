@@ -125,6 +125,27 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void ExportBms_Click(object? sender, RoutedEventArgs e)
+    {
+        var file = await StorageProvider.SaveFilePickerAsync(new Avalonia.Platform.Storage.FilePickerSaveOptions
+        {
+            Title = "Export BMS Compatibility File",
+            SuggestedFileName = "export.bms",
+            FileTypeChoices =
+            [
+                new Avalonia.Platform.Storage.FilePickerFileType("BMS")
+                {
+                    Patterns = ["*.bms"]
+                }
+            ]
+        });
+
+        if (file?.Path.LocalPath is { Length: > 0 } path)
+        {
+            await RunUiTaskAsync(() => _viewModel.ExportSelectedChartToBmsAsync(path));
+        }
+    }
+
     private async void ConvertBms_Click(object? sender, RoutedEventArgs e)
     {
         var sourceFolders = await StorageProvider.OpenFolderPickerAsync(new Avalonia.Platform.Storage.FolderPickerOpenOptions
@@ -245,6 +266,26 @@ public sealed partial class MainWindow : Window
     private void EditorTimelineScrollViewer_Loaded(object? sender, RoutedEventArgs e)
     {
         QueueScrollEditorTimelineToMeasureZero();
+    }
+
+    private void EditorTimelineScrollViewer_PointerWheelChanged(object? sender, PointerWheelEventArgs e)
+    {
+        if (Math.Abs(e.Delta.Y) < 0.001)
+        {
+            return;
+        }
+
+        var multiplier = e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? 2.5 : 1.0;
+        var stepPixels = Math.Max(240.0, EditorTimelineScrollViewer.Viewport.Height * 0.32) * multiplier;
+        var maxOffsetY = Math.Max(
+            0,
+            EditorTimelineScrollViewer.Extent.Height - EditorTimelineScrollViewer.Viewport.Height);
+        var offsetY = Math.Clamp(
+            EditorTimelineScrollViewer.Offset.Y - e.Delta.Y * stepPixels,
+            0,
+            maxOffsetY);
+        EditorTimelineScrollViewer.Offset = new Avalonia.Vector(EditorTimelineScrollViewer.Offset.X, offsetY);
+        e.Handled = true;
     }
 
     private void EditorTimelineCanvas_SizeChanged(object? sender, SizeChangedEventArgs e)

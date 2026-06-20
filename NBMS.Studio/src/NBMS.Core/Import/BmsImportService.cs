@@ -381,9 +381,18 @@ public sealed partial class BmsImportService
         {
             doc.StopDefinitions[key[4..]] = stopValue;
         }
+        else if (upperKey.StartsWith("SCROLL", StringComparison.Ordinal) && key.Length == 8 &&
+                 double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var scrollValue))
+        {
+            doc.ScrollDefinitions[key[6..]] = scrollValue;
+        }
         else if (IsRandomDirective(upperKey))
         {
             doc.RandomDirectives.Add(string.IsNullOrWhiteSpace(value) ? key : $"{key} {value}");
+        }
+        else
+        {
+            AddUnsupportedDirective(doc, $"#{key}");
         }
     }
 
@@ -414,6 +423,12 @@ public sealed partial class BmsImportService
 
             if (line.Channel == "02")
             {
+                continue;
+            }
+
+            if (!IsRecognizedChannel(line.Channel))
+            {
+                AddUnsupportedDirective(doc, $"#{line.Measure:000}{line.Channel}");
                 continue;
             }
 
@@ -453,6 +468,7 @@ public sealed partial class BmsImportService
             .OrderBy(item => item.Tick)
             .ThenBy(item => item.Lane, StringComparer.Ordinal)
             .ToList();
+        ApplyBmsCompatibilityMetadata(doc, chart);
 
         var header = new NbmsHeader
         {
@@ -483,7 +499,7 @@ public sealed partial class BmsImportService
             Security = new SecurityInfo { Signed = false, Encrypted = false, EditPolicy = "open" }
         };
 
-        return new BmsImportResult(header, chart, doc.Wav, BuildMediaFiles(doc));
+        return new BmsImportResult(header, chart, doc.Wav, BuildMediaFiles(doc), BuildCompatibilityReport(doc));
     }
 
     private static NbmsChart CreateBaseChart(BmsImportDocument doc, string mode)
@@ -500,29 +516,27 @@ public sealed partial class BmsImportService
             ]
         };
 
-        if (!string.IsNullOrWhiteSpace(doc.LnObj))
+        if (doc.ScrollDefinitions.Count > 0 || doc.ChannelLines.Any(line => line.Channel == "SC"))
         {
-            chart.Timing.Add(new TimingEvent { Tick = 0, Type = "lnobj", Event = doc.LnObj });
-        }
-
-        if (doc.RandomDirectives.Count > 0 ||
-            ResolveSourceFormat(doc) != "bms" ||
-            !string.IsNullOrWhiteSpace(doc.SourceEncoding))
-        {
-            chart.Metadata = JsonSerializer.SerializeToElement(new
+            chart.Extensions.Add(new ExtensionDeclaration
             {
-                bmsCompat = new
-                {
-                    sourceFormat = ResolveSourceFormat(doc),
-                    sourceExtension = doc.SourceExtension,
-                    sourceEncoding = doc.SourceEncoding,
-                    charsetDirective = doc.CharsetDirective,
-                    encodingDetection = doc.EncodingDetection,
-                    encodingWarnings = doc.EncodingWarnings,
-                    randomDirectives = doc.RandomDirectives
-                }
+                Id = "nbms.scroll",
+                Version = "0.1.0",
+                Required = false
             });
         }
+
+        if (!string.IsNullOrWhiteSpace(doc.LnObj))
+        {
+            chart.Extensions.Add(new ExtensionDeclaration
+            {
+                Id = "nbms.longNote",
+                Version = "0.1.0",
+                Required = false
+            });
+        }
+
+        ApplyBmsCompatibilityMetadata(doc, chart);
 
         return chart;
     }
@@ -530,6 +544,83 @@ public sealed partial class BmsImportService
     private static bool IsRandomDirective(string upperKey)
     {
         return upperKey is "RANDOM" or "SETRANDOM" or "IF" or "ELSEIF" or "ELSE" or "ENDIF" or "ENDRANDOM";
+    }
+
+    private static BmsImportCompatibilityReport BuildCompatibilityReport(BmsImportDocument doc)
+    {
+        return new BmsImportCompatibilityReport(
+            RandomPreserved: doc.RandomDirectives.Count > 0,
+            BranchNotExpanded: doc.RandomDirectives.Count > 0,
+            LnObj: doc.LnObj ?? "",
+            UnsupportedDirectives: doc.UnsupportedDirectives
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Order(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
+    }
+
+    private static void ApplyBmsCompatibilityMetadata(BmsImportDocument doc, NbmsChart chart)
+    {
+        if (doc.RandomDirectives.Count == 0 &&
+            ResolveSourceFormat(doc) == "bms" &&
+            string.IsNullOrWhiteSpace(doc.SourceEncoding) &&
+            string.IsNullOrWhiteSpace(doc.LnObj) &&
+            doc.UnsupportedDirectives.Count == 0)
+        {
+            return;
+        }
+
+        var compatibilityReport = BuildCompatibilityReport(doc);
+        chart.Metadata = JsonSerializer.SerializeToElement(new
+        {
+            bmsCompat = new
+            {
+                sourceFormat = ResolveSourceFormat(doc),
+                sourceExtension = doc.SourceExtension,
+                sourceEncoding = doc.SourceEncoding,
+                charsetDirective = doc.CharsetDirective,
+                encodingDetection = doc.EncodingDetection,
+                encodingWarnings = doc.EncodingWarnings,
+                lnObj = doc.LnObj,
+                randomDirectives = doc.RandomDirectives,
+                randomPreserved = compatibilityReport.RandomPreserved,
+                branchNotExpanded = compatibilityReport.BranchNotExpanded,
+                unsupportedDirectives = compatibilityReport.UnsupportedDirectives
+            },
+            extensions = string.IsNullOrWhiteSpace(doc.LnObj)
+                ? null
+                : new Dictionary<string, object?>
+                {
+                    ["nbms.longNote"] = new
+                    {
+                        bmsCompat = new
+                        {
+                            lnObj = doc.LnObj
+                        }
+                    }
+                }
+        });
+    }
+
+    private static void AddUnsupportedDirective(BmsImportDocument doc, string directive)
+    {
+        if (string.IsNullOrWhiteSpace(directive))
+        {
+            return;
+        }
+
+        if (doc.UnsupportedDirectives.Contains(directive, StringComparer.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        doc.UnsupportedDirectives.Add(directive);
+    }
+
+    private static bool IsRecognizedChannel(string channel)
+    {
+        return channel is "01" or "02" or "03" or "04" or "06" or "07" or "08" or "09" or "SC" ||
+               NoteChannels.ContainsKey(channel) ||
+               LongNoteChannels.ContainsKey(channel);
     }
 
     private static void AddChannelEvent(
@@ -563,6 +654,17 @@ public sealed partial class BmsImportService
         else if (channel == "09" && doc.StopDefinitions.TryGetValue(token, out var stopValue))
         {
             chart.Timing.Add(new TimingEvent { Tick = tick, Type = "stop", DurationTicks = StopValueToTicks(stopValue) });
+        }
+        else if (channel == "SC" && doc.ScrollDefinitions.TryGetValue(token, out var scrollValue))
+        {
+            chart.Timing.Add(new TimingEvent
+            {
+                Tick = tick,
+                Type = "scroll",
+                Value = scrollValue,
+                ExtensionId = "nbms.scroll",
+                Event = "scroll"
+            });
         }
         else if ((channel == "04" || channel == "07" || channel == "06") &&
                  TryResolveMediaId(channel, token, bmpToMediaId, bgaToMediaId, layerToMediaId, poorToMediaId, out var mediaId))
@@ -933,6 +1035,7 @@ public sealed partial class BmsImportService
             ".bme" => "bme",
             ".bml" => "bml",
             ".ibmsc" => "ibmsc",
+            ".divergence" => "divergence",
             _ => "bms"
         };
     }
@@ -1034,7 +1137,9 @@ public sealed partial class BmsImportService
             "bar" => 0,
             "bpm" => 1,
             "stop" => 2,
-            "lnobj" => 3,
+            "scroll" => 3,
+            "speed" => 4,
+            "lnobj" => 5,
             _ => 9
         };
     }
@@ -1090,7 +1195,14 @@ public sealed record BmsImportResult(
     NbmsHeader Header,
     NbmsChart Chart,
     Dictionary<string, string> WavFiles,
-    Dictionary<string, string> MediaFiles);
+    Dictionary<string, string> MediaFiles,
+    BmsImportCompatibilityReport CompatibilityReport);
+
+public sealed record BmsImportCompatibilityReport(
+    bool RandomPreserved,
+    bool BranchNotExpanded,
+    string LnObj,
+    IReadOnlyList<string> UnsupportedDirectives);
 
 internal sealed class BmsImportDocument
 {
@@ -1116,8 +1228,10 @@ internal sealed class BmsImportDocument
     public Dictionary<string, string> PoorDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> BpmDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, double> StopDefinitions { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, double> ScrollDefinitions { get; } = new(StringComparer.Ordinal);
     public Dictionary<int, double> MeasureLengths { get; } = [];
     public List<string> RandomDirectives { get; } = [];
+    public List<string> UnsupportedDirectives { get; } = [];
     public List<BmsChannelLine> ChannelLines { get; } = [];
 }
 

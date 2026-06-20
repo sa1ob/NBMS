@@ -22,6 +22,12 @@ public sealed class ViewerGame : Game
     private const float StatusScale = 2f;
     private const double VideoPreloadLeadSeconds = 3.0;
     private const double VideoSeekToleranceSeconds = 0.05;
+    private const double InitialAudioPrepareWindowSeconds = 10.0;
+    private const double AudioScheduleLookaheadSeconds = 0.25;
+    private const double VisibleNotePastSeconds = 2.0;
+    private const double VisibleNoteFutureSeconds = 14.0;
+    private const int BackgroundAudioPrepareBatchSize = 4;
+    private const int BackgroundAudioPreparePauseMilliseconds = 24;
 
     private readonly ViewerOptions _options;
     private readonly GraphicsDeviceManager _graphics;
@@ -34,6 +40,8 @@ public sealed class ViewerGame : Game
     private string _rootDirectory = "";
     private ViewerAudioBank? _audioBank;
     private ViewerAudioPlayer? _audioPlayer;
+    private CancellationTokenSource? _audioPrepareCts;
+    private Task? _audioPrepareTask;
     private LoadedChart? _chart;
     private MediaManifest? _mediaManifest;
     private readonly Dictionary<string, Texture2D> _mediaTextures = new(StringComparer.Ordinal);
@@ -43,6 +51,7 @@ public sealed class ViewerGame : Game
     private List<MediaScheduleItem> _mediaSchedule = [];
     private List<double> _measureSeconds = [];
     private List<BpmMarker> _bpmMarkers = [];
+    private List<ScrollSegment> _scrollSegments = [new(0, 1.0, 0)];
     private List<string> _statusLines = [];
     private readonly Queue<string> _logLines = [];
     private readonly Stopwatch _playbackClock = new();
@@ -51,6 +60,7 @@ public sealed class ViewerGame : Game
     private double _startOffsetSeconds;
     private double? _rangeEndSeconds;
     private double _lastQueuedAudioEndSeconds;
+    private double _maxNoteDurationSeconds;
     private double _spaceHeldSeconds;
     private bool _spaceRestartTriggered;
     private bool _playbackClockFrozen;
@@ -69,11 +79,16 @@ public sealed class ViewerGame : Game
     private double _currentVideoStartSeconds;
     private Texture2D? _videoTexture;
     private byte[]? _videoFrameBuffer;
+    private double _lastVideoMetricLogSeconds = -1;
+    private int _videoMetricFrameCount;
+    private double _videoMetricCopyMs;
+    private double _videoMetricUploadMs;
     private string? _mediaTempDirectory;
     private FpsLimitMode _fpsLimitMode = FpsLimitMode.Unlimited;
     private double _fpsSampleSeconds;
     private int _fpsSampleFrames;
     private double _displayFps;
+    private bool _hasLoggedFirstFrame;
     private string _statusText = "Drop NBMS header path as argument.";
 
     public ViewerGame(ViewerOptions options)
@@ -99,6 +114,7 @@ public sealed class ViewerGame : Game
     {
         if (disposing)
         {
+            StopAudioPrepareTask();
             _audioPlayer?.Dispose();
             _audioBank?.Dispose();
             foreach (var texture in _mediaTextures.Values)
@@ -251,8 +267,9 @@ public sealed class ViewerGame : Game
 
     protected override void Draw(GameTime gameTime)
     {
-        if (_playbackSeconds == 0)
+        if (!_hasLoggedFirstFrame)
         {
+            _hasLoggedFirstFrame = true;
             AppendViewerLog("Draw first frame");
         }
 
@@ -274,6 +291,7 @@ public sealed class ViewerGame : Game
 
     private void LoadProject()
     {
+        using var measure = PerformanceLog.Measure($"Viewer.LoadProject chart={_options.ChartId ?? "<auto>"}");
         AppendViewerLog($"LoadProject header={_options.HeaderPath ?? "<null>"} chart={_options.ChartId ?? "<null>"}");
         if (string.IsNullOrWhiteSpace(_options.HeaderPath) || !File.Exists(_options.HeaderPath))
         {
@@ -342,6 +360,7 @@ public sealed class ViewerGame : Game
 
     private void BuildRenderData(NbmsChart chart)
     {
+        using var measure = PerformanceLog.Measure($"Viewer.BuildRenderData notes={chart.Notes.Count} bgm={chart.BackgroundAudio.Count} media={chart.MediaEvents.Count}");
         var maxTick = Math.Max(chart.Notes.Count == 0 ? 0 : chart.Notes.Max(note => note.Tick), chart.Resolution * 4);
         var measureTicks = new List<int>();
         for (var tick = 0; tick <= maxTick + chart.Resolution * 4; tick += chart.Resolution * 4)
@@ -367,6 +386,7 @@ public sealed class ViewerGame : Game
             noteTicks
                 .Concat(holdEndTicks)
                 .Concat(bpmEvents.Select(timing => timing.Tick))
+                .Concat(chart.Timing.Where(timing => timing.Type == "scroll" && timing.Value is not null).Select(timing => timing.Tick))
                 .Concat(chart.BackgroundAudio.Select(item => item.Tick))
                 .Concat(chart.MediaEvents.Select(item => item.Tick))
                 .Concat(_options.StartTick is { } startTick ? [startTick] : [])
@@ -384,6 +404,9 @@ public sealed class ViewerGame : Game
             .Where(note => note.LaneIndex >= 0)
             .OrderBy(note => note.TimeSeconds)
             .ToList();
+        _maxNoteDurationSeconds = _notes.Count == 0
+            ? 0
+            : _notes.Max(note => Math.Max(0, note.EndTimeSeconds - note.TimeSeconds));
 
         var noteAudio = chart.Notes
             .Where(note => !string.IsNullOrWhiteSpace(note.AudioId))
@@ -431,6 +454,7 @@ public sealed class ViewerGame : Game
             .OrderBy(marker => marker.TimeSeconds)
             .ToList();
 
+        _scrollSegments = BuildScrollSegments(chart, secondsByTick);
         ApplyStartTickOffset(secondsByTick);
     }
 
@@ -546,20 +570,23 @@ public sealed class ViewerGame : Game
 
     private void LoadAudioBank(NbmsHeader header, string rootDirectory)
     {
+        using var measure = PerformanceLog.Measure($"Viewer.LoadAudioBank schedule={_audioSchedule.Count}");
         try
         {
             var audioPath = Path.GetFullPath(Path.Combine(
                 rootDirectory,
                 header.Audio.File.Replace('/', Path.DirectorySeparatorChar)));
-            var requiredAudioIds = _audioSchedule.Select(item => item.AudioId).Distinct(StringComparer.Ordinal);
+            var requiredAudioIds = _audioSchedule.Select(item => item.AudioId).Distinct(StringComparer.Ordinal).ToList();
             _audioBank = ViewerAudioBank.Load(audioPath, requiredAudioIds);
             var audioSettings = new ViewerAudioSettings(
                 _options.AudioVolume,
                 _options.MasterGain,
                 _options.LimiterThreshold);
             _audioPlayer = new ViewerAudioPlayer(audioSettings);
-            var preloaded = _audioPlayer.Preload(_audioBank.Files);
-            AddLog($"audio ready {_audioBank.Count} preload={preloaded} vol={audioSettings.AudioVolume:0.00} gain={audioSettings.MasterGain:0.00} limit={audioSettings.LimiterThreshold:0.00}");
+            StopAudioPrepareTask();
+            var extracted = _audioBank.ExtractFiles(requiredAudioIds);
+            var preloaded = _audioPlayer.Preload(extracted);
+            AddLog($"audio ready {_audioBank.Count} extracted={_audioBank.ExtractedCount} preload={preloaded} vol={audioSettings.AudioVolume:0.00} gain={audioSettings.MasterGain:0.00} limit={audioSettings.LimiterThreshold:0.00}");
         }
         catch (Exception ex)
         {
@@ -568,11 +595,109 @@ public sealed class ViewerGame : Game
         }
     }
 
+    private IReadOnlyList<string> ResolveInitialAudioPrepareIds(IReadOnlyList<string> requiredAudioIds)
+    {
+        var startSeconds = _startOffsetSeconds;
+        var endSeconds = startSeconds + InitialAudioPrepareWindowSeconds;
+        var ids = _audioSchedule
+            .Where(item => item.TimeSeconds >= startSeconds - 0.001 && item.TimeSeconds <= endSeconds)
+            .Select(item => item.AudioId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (ids.Count > 0)
+        {
+            return ids;
+        }
+
+        return requiredAudioIds.Take(Math.Min(32, requiredAudioIds.Count)).ToList();
+    }
+
+    private void StartBackgroundAudioPrepare(IReadOnlyList<string> requiredAudioIds, IReadOnlyList<string> initialAudioIds)
+    {
+        StopAudioPrepareTask();
+        if (_audioBank is null || _audioPlayer is null)
+        {
+            return;
+        }
+
+        var initial = initialAudioIds.ToHashSet(StringComparer.Ordinal);
+        var remaining = requiredAudioIds
+            .Where(id => !initial.Contains(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (remaining.Count == 0)
+        {
+            return;
+        }
+
+        _audioPrepareCts = new CancellationTokenSource();
+        var token = _audioPrepareCts.Token;
+        var bank = _audioBank;
+        var player = _audioPlayer;
+        _audioPrepareTask = Task.Run(() =>
+        {
+            try
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                using var measure = PerformanceLog.Measure($"Viewer.BackgroundAudioPrepare ids={remaining.Count}");
+                var prepared = 0;
+                for (var index = 0; index < remaining.Count; index += BackgroundAudioPrepareBatchSize)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var batch = remaining
+                        .Skip(index)
+                        .Take(BackgroundAudioPrepareBatchSize)
+                        .ToList();
+                    var files = bank.ExtractFiles(batch, writePerformanceLog: false);
+                    prepared += player.Preload(files, writePerformanceLog: false);
+                    if (token.WaitHandle.WaitOne(BackgroundAudioPreparePauseMilliseconds))
+                    {
+                        break;
+                    }
+                }
+
+                PerformanceLog.Mark($"Viewer.BackgroundAudioPrepare prepared={prepared} extracted={bank.ExtractedCount}");
+            }
+            catch (OperationCanceledException)
+            {
+                PerformanceLog.Mark("Viewer.BackgroundAudioPrepare canceled");
+            }
+            catch (Exception ex)
+            {
+                PerformanceLog.Mark($"Viewer.BackgroundAudioPrepare failed {ex.GetType().Name}: {ex.Message}");
+            }
+        }, token);
+    }
+
+    private void StopAudioPrepareTask()
+    {
+        if (_audioPrepareCts is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _audioPrepareCts.Cancel();
+            _audioPrepareTask?.Wait(TimeSpan.FromMilliseconds(500));
+        }
+        catch
+        {
+        }
+        finally
+        {
+            _audioPrepareCts.Dispose();
+            _audioPrepareCts = null;
+            _audioPrepareTask = null;
+        }
+    }
+
     private void QueueUpcomingAudioEvents()
     {
-        const double scheduleLookaheadSeconds = 0.12;
         while (_nextAudioIndex < _audioSchedule.Count &&
-               _audioSchedule[_nextAudioIndex].TimeSeconds <= _playbackSeconds + scheduleLookaheadSeconds)
+               _audioSchedule[_nextAudioIndex].TimeSeconds <= _playbackSeconds + AudioScheduleLookaheadSeconds)
         {
             var item = _audioSchedule[_nextAudioIndex++];
             var delaySeconds = item.TimeSeconds - _playbackSeconds;
@@ -631,6 +756,7 @@ public sealed class ViewerGame : Game
 
     private void PreloadInitialVideoEvent()
     {
+        using var measure = PerformanceLog.Measure("Viewer.PreloadInitialVideoEvent", minimumElapsedMs: 10);
         if (_preloadedVideoDecoder is not null || _videoDecoder is not null)
         {
             return;
@@ -808,9 +934,16 @@ public sealed class ViewerGame : Game
 
         DrawRect(left + playfieldWidth - 1, top, 1, bottom - top, new Color(115, 118, 128));
 
-        foreach (var measureSecond in _measureSeconds)
+        var visibleMeasureStartIndex = LowerBound(_measureSeconds, _playbackSeconds - VisibleNotePastSeconds);
+        for (var index = visibleMeasureStartIndex; index < _measureSeconds.Count; index++)
         {
-            var y = judgeY - (float)(measureSecond - _playbackSeconds) * speed;
+            var measureSecond = _measureSeconds[index];
+            if (measureSecond > _playbackSeconds + VisibleNoteFutureSeconds)
+            {
+                break;
+            }
+
+            var y = judgeY - (float)ResolveVisualDistanceSeconds(_playbackSeconds, measureSecond) * speed;
             if (y < top || y > bottom)
             {
                 continue;
@@ -819,10 +952,19 @@ public sealed class ViewerGame : Game
             DrawRect(left, y, playfieldWidth, 2f, new Color(200, 206, 216));
         }
 
-        foreach (var note in _notes)
+        var visibleNoteStartSeconds = _playbackSeconds - VisibleNotePastSeconds - _maxNoteDurationSeconds;
+        var visibleNoteEndSeconds = _playbackSeconds + VisibleNoteFutureSeconds;
+        var visibleNoteStartIndex = LowerBound(_notes, visibleNoteStartSeconds);
+        for (var index = visibleNoteStartIndex; index < _notes.Count; index++)
         {
-            var y = judgeY - (float)(note.TimeSeconds - _playbackSeconds) * speed;
-            var endY = judgeY - (float)(note.EndTimeSeconds - _playbackSeconds) * speed;
+            var note = _notes[index];
+            if (note.TimeSeconds > visibleNoteEndSeconds)
+            {
+                break;
+            }
+
+            var y = judgeY - (float)ResolveVisualDistanceSeconds(_playbackSeconds, note.TimeSeconds) * speed;
+            var endY = judgeY - (float)ResolveVisualDistanceSeconds(_playbackSeconds, note.EndTimeSeconds) * speed;
             var visibleTop = Math.Min(y, endY);
             var visibleBottom = Math.Max(y, endY);
             if (visibleBottom < top - 16 || visibleTop > bottom + 16)
@@ -845,6 +987,98 @@ public sealed class ViewerGame : Game
         }
 
         DrawRect(left, judgeY, playfieldWidth, 4, new Color(255, 48, 48));
+    }
+
+    private static List<ScrollSegment> BuildScrollSegments(NbmsChart chart, IReadOnlyDictionary<int, double> secondsByTick)
+    {
+        var events = chart.Timing
+            .Where(timing => timing.Type == "scroll" && timing.Value is not null)
+            .OrderBy(timing => timing.Tick)
+            .ToList();
+        var segments = new List<ScrollSegment> { new(0, 1.0, 0) };
+        var currentScroll = 1.0;
+        var previousSeconds = 0.0;
+        var cumulativeVisualSeconds = 0.0;
+
+        foreach (var timing in events)
+        {
+            if (!secondsByTick.TryGetValue(timing.Tick, out var seconds))
+            {
+                continue;
+            }
+
+            if (seconds < previousSeconds)
+            {
+                continue;
+            }
+
+            cumulativeVisualSeconds += (seconds - previousSeconds) * currentScroll;
+            currentScroll = NormalizeChartScroll(timing.Value!.Value);
+            previousSeconds = seconds;
+
+            if (segments.Count > 0 && Math.Abs(segments[^1].StartSeconds - seconds) < 0.000001)
+            {
+                segments[^1] = new ScrollSegment(seconds, currentScroll, cumulativeVisualSeconds);
+            }
+            else
+            {
+                segments.Add(new ScrollSegment(seconds, currentScroll, cumulativeVisualSeconds));
+            }
+        }
+
+        return segments;
+    }
+
+    private static double NormalizeChartScroll(double value)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+        {
+            return 1.0;
+        }
+
+        // SCROLLは音声時刻を変えず描画距離だけに作用する。極端値はViewerの座標破綻を避けるため保守的に制限する。
+        return Math.Clamp(value, -8.0, 8.0);
+    }
+
+    private double ResolveVisualDistanceSeconds(double fromSeconds, double toSeconds)
+    {
+        if (_scrollSegments.Count <= 1)
+        {
+            return toSeconds - fromSeconds;
+        }
+
+        return ResolveVisualPositionSeconds(toSeconds) - ResolveVisualPositionSeconds(fromSeconds);
+    }
+
+    private double ResolveVisualPositionSeconds(double seconds)
+    {
+        if (_scrollSegments.Count == 0)
+        {
+            return seconds;
+        }
+
+        var segment = _scrollSegments[FindScrollSegmentIndex(seconds)];
+        return segment.CumulativeVisualSeconds + (seconds - segment.StartSeconds) * segment.Scroll;
+    }
+
+    private int FindScrollSegmentIndex(double seconds)
+    {
+        var low = 0;
+        var high = _scrollSegments.Count - 1;
+        while (low <= high)
+        {
+            var mid = low + ((high - low) / 2);
+            if (_scrollSegments[mid].StartSeconds <= seconds)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return Math.Clamp(high, 0, _scrollSegments.Count - 1);
     }
 
     private void DrawBgaBackground()
@@ -898,6 +1132,7 @@ public sealed class ViewerGame : Game
 
     private void LoadMediaBank(NbmsHeader header, string rootDirectory, NbmsChart chart)
     {
+        using var measure = PerformanceLog.Measure($"Viewer.LoadMediaBank mediaEvents={chart.MediaEvents.Count}");
         if (header.Media is not { File.Length: > 0 } mediaReference)
         {
             AddLog("media none");
@@ -1123,9 +1358,8 @@ public sealed class ViewerGame : Game
             _displayFps = _fpsSampleFrames / _fpsSampleSeconds;
             _fpsSampleSeconds = 0;
             _fpsSampleFrames = 0;
+            Window.Title = $"NBMS MonoGame Viewer - {_statusText} - FPS {_displayFps:0} {GetFpsModeLabel()} - t {_playbackSeconds:0.000}s - HS {_hiSpeed:0.0}";
         }
-
-        Window.Title = $"NBMS MonoGame Viewer - {_statusText} - FPS {_displayFps:0} {GetFpsModeLabel()} - t {_playbackSeconds:0.000}s - HS {_hiSpeed:0.0}";
     }
 
     private void CycleFpsLimitMode()
@@ -1345,7 +1579,10 @@ public sealed class ViewerGame : Game
         var presentationTime = TimeSpan.FromSeconds(Math.Max(
             0,
             _playbackSeconds - _currentVideoStartSeconds + _options.VideoLeadSeconds));
-        if (_videoDecoder.TryCopyFrame(_videoFrameBuffer, presentationTime))
+        var copyWatch = Stopwatch.StartNew();
+        var frameCopied = _videoDecoder.TryCopyFrame(_videoFrameBuffer, presentationTime);
+        copyWatch.Stop();
+        if (frameCopied)
         {
             if (_videoTexture is null ||
                 _videoTexture.Width != _videoDecoder.OutputWidth ||
@@ -1360,10 +1597,44 @@ public sealed class ViewerGame : Game
                     SurfaceFormat.Color);
             }
 
+            var uploadWatch = Stopwatch.StartNew();
             _videoTexture.SetData(_videoFrameBuffer);
+            uploadWatch.Stop();
+            AccumulateVideoFrameMetrics(copyWatch.Elapsed.TotalMilliseconds, uploadWatch.Elapsed.TotalMilliseconds);
         }
 
         return _videoTexture;
+    }
+
+    private void AccumulateVideoFrameMetrics(double copyMs, double uploadMs)
+    {
+        if (!_isLogVisible)
+        {
+            return;
+        }
+
+        _videoMetricFrameCount++;
+        _videoMetricCopyMs += copyMs;
+        _videoMetricUploadMs += uploadMs;
+
+        if (_playbackSeconds - _lastVideoMetricLogSeconds < 1.0 && _lastVideoMetricLogSeconds >= 0)
+        {
+            return;
+        }
+
+        if (_videoMetricFrameCount == 0)
+        {
+            return;
+        }
+
+        PerformanceLog.Mark(
+            $"Viewer.VideoFrame decoder={_videoDecoder?.GetType().Name ?? "<none>"} frames={_videoMetricFrameCount} " +
+            $"copyMs={_videoMetricCopyMs:0.###} uploadMs={_videoMetricUploadMs:0.###} " +
+            $"avgCopyMs={_videoMetricCopyMs / _videoMetricFrameCount:0.###} avgUploadMs={_videoMetricUploadMs / _videoMetricFrameCount:0.###}");
+        _lastVideoMetricLogSeconds = _playbackSeconds;
+        _videoMetricFrameCount = 0;
+        _videoMetricCopyMs = 0;
+        _videoMetricUploadMs = 0;
     }
 
     private void PlayVideo(string videoPath, double seekOffsetSeconds = 0)
@@ -1470,6 +1741,10 @@ public sealed class ViewerGame : Game
         _preloadedVideoPath = null;
         _currentVideoStartSeconds = 0;
         _videoFrameBuffer = null;
+        _lastVideoMetricLogSeconds = -1;
+        _videoMetricFrameCount = 0;
+        _videoMetricCopyMs = 0;
+        _videoMetricUploadMs = 0;
     }
 
     private void DrawVideoStatus(Microsoft.Xna.Framework.Rectangle rect)
@@ -1516,6 +1791,46 @@ public sealed class ViewerGame : Game
     {
         var invalid = Path.GetInvalidFileNameChars().ToHashSet();
         return new string(value.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+    }
+
+    private static int LowerBound(IReadOnlyList<double> values, double target)
+    {
+        var low = 0;
+        var high = values.Count;
+        while (low < high)
+        {
+            var mid = low + ((high - low) / 2);
+            if (values[mid] < target)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        return low;
+    }
+
+    private static int LowerBound(IReadOnlyList<RenderNote> values, double targetTimeSeconds)
+    {
+        var low = 0;
+        var high = values.Count;
+        while (low < high)
+        {
+            var mid = low + ((high - low) / 2);
+            if (values[mid].TimeSeconds < targetTimeSeconds)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        return low;
     }
 
     private void DrawRect(float x, float y, float width, float height, Color color)
@@ -1700,6 +2015,8 @@ public sealed class ViewerGame : Game
         string AudioId);
 
     private sealed record BpmMarker(double TimeSeconds, double Bpm);
+
+    private sealed record ScrollSegment(double StartSeconds, double Scroll, double CumulativeVisualSeconds);
 
     private sealed record MediaScheduleItem(double TimeSeconds, int Tick, string MediaId, string Type, int? Layer);
 

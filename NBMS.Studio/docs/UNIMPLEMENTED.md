@@ -29,7 +29,8 @@ NBMS Studioはプロトタイプです。以下は未実装または未確定で
 ## BMS変換
 
 - RANDOM / IF / SWITCH
-- BGAとBMP/AVI処理
+- BMS互換出力の高度なBGA/layer合成再現
+- BMS互換出力の高度な再量子化
 - mine note
 - invisible note
 - LN方言の完全互換
@@ -93,7 +94,8 @@ NBMS Studio is a prototype. The following areas are not final.
 ## BMS Conversion
 
 - RANDOM / IF / SWITCH
-- BGA and BMP/AVI handling
+- advanced BGA/layer composition for BMS compatibility export
+- advanced re-quantization for BMS compatibility export
 - mine notes
 - invisible notes
 - complete LN dialect compatibility

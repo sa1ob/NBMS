@@ -72,7 +72,7 @@ public sealed class AudioArchiveService
         await using (var stream = File.Open(audioArchivePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, leaveOpen: false))
         {
-            var entry = archive.CreateEntry(archivePath, CompressionLevel.Optimal);
+            var entry = archive.CreateEntry(archivePath, ArchiveCompressionPolicy.ForAssetPath(archivePath));
             await using var entryStream = entry.Open();
             await using var sourceStream = File.OpenRead(sourceFilePath);
             await sourceStream.CopyToAsync(entryStream, cancellationToken);
@@ -183,6 +183,44 @@ public sealed class AudioArchiveService
         return issues;
     }
 
+    public async Task ExtractAudioFilesAsync(
+        string audioArchivePath,
+        AudioManifest manifest,
+        string destinationDirectory,
+        IReadOnlyDictionary<string, string> outputFileNames,
+        CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(destinationDirectory);
+        await using var stream = File.OpenRead(audioArchivePath);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false);
+        foreach (var entry in manifest.Entries)
+        {
+            if (!outputFileNames.TryGetValue(entry.AudioId, out var outputFileName) ||
+                string.IsNullOrWhiteSpace(outputFileName))
+            {
+                continue;
+            }
+
+            var archivePath = entry.Path.Replace('\\', '/');
+            var archiveEntry = archive.GetEntry(archivePath);
+            if (archiveEntry is null)
+            {
+                continue;
+            }
+
+            var safeFileName = Path.GetFileName(outputFileName);
+            if (string.IsNullOrWhiteSpace(safeFileName))
+            {
+                continue;
+            }
+
+            var outputPath = Path.Combine(destinationDirectory, safeFileName);
+            await using var input = archiveEntry.Open();
+            await using var output = File.Create(outputPath);
+            await input.CopyToAsync(output, cancellationToken);
+        }
+    }
+
     private string EnsureUniqueArchivePath(string audioArchivePath, string preferredPath)
     {
         var existing = File.Exists(audioArchivePath)
@@ -221,7 +259,7 @@ public sealed class AudioArchiveService
         }
 
         archive.GetEntry(newPath)?.Delete();
-        var newEntry = archive.CreateEntry(newPath, CompressionLevel.Optimal);
+        var newEntry = archive.CreateEntry(newPath, ArchiveCompressionPolicy.ForAssetPath(newPath));
         await using (var oldStream = oldEntry.Open())
         await using (var newStream = newEntry.Open())
         {

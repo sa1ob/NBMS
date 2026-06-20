@@ -30,6 +30,40 @@ NBMS.Studio.MonoGameViewer.exe <header.nbmh> --chart <chartId> [options]
   - 範囲は `0` から `1500`。
   - 既定値は `360` ms。
   - WindowsMedia経路では動画decode/captureが遅れやすいため、少し先の動画位置を表示するために使う。
+- `--audio-volume <value>`
+  - Viewer内の発音音量。
+  - 範囲は `0.0` から `2.0`。
+  - 既定値は `0.28`。
+- `--master-gain <value>`
+  - limiter前の全体gain。
+  - 範囲は `0.0` から `2.0`。
+  - 既定値は `0.82`。
+- `--limiter-threshold <value>`
+  - simple limiterの閾値。
+  - 範囲は `0.1` から `1.0`。
+  - 既定値は `0.90`。
+
+## キーボード操作
+
+- `1` / `2` / `3` / `4`
+  - Hi-Speedを `1.0` / `2.0` / `3.0` / `4.0` に切り替える。
+- `5`
+  - 5keys/7keys系のBGA表示位置を1P側/2P側で切り替える。
+- `7`
+  - FPS modeを `LOCK60` -> `LOCK120` -> `UNLIMITED` の順に切り替える。
+- `9`
+  - Viewer内ログ表示をON/OFFする。
+- `Space`
+  - 先頭から再再生する。
+
+## ログ
+
+- `%TEMP%\NBMS.Studio.MonoGameViewer.log`
+  - Viewer起動、引数parse、プロジェクト読み込み、動画decoder状態などを記録する。
+- `%TEMP%\NBMS.Studio.Performance.log`
+  - Studio/Viewer共通の性能計測ログ。
+  - `Viewer.VideoFrame` はBGA動画のframe copy時間とtexture upload時間を1秒程度ごとに集計する。
+  - `ViewerAudioPlayer.Preload` はpreload済み件数、PCM cache bytes、codec別preload failure数を出す。
 
 ## Studio設定との対応
 
@@ -80,4 +114,3 @@ Studio側の `Show ffmpeg status` は、上記に近い順序で現在使えそ�
 - [ ] Viewerがプロセスごと落ちないことを確認する。
 - [ ] `%TEMP%\NBMS.Studio.MonoGameViewer.log` に `video failed` または `PlayVideo failed` が出ることを確認する。
 - [ ] 画面上はBGAなし、または `BGA VIDEO ERROR / CHECK FFMPEG` として継続することを確認する。
-

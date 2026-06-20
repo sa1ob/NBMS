@@ -1,20 +1,26 @@
 using NAudio.Vorbis;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
+using NBMS.Core.Services;
 
 namespace NBMS.Studio.MonoGameViewer;
 
 public sealed class ViewerAudioPlayer : IDisposable
 {
     private const int MaxPreloadSeconds = 45;
+    private const long MaxPreloadCacheBytes = 1536L * 1024L * 1024L;
 
     private readonly WaveOutEvent _output;
     private readonly MixingSampleProvider _mixer;
     private readonly WaveFormat _mixFormat = WaveFormat.CreateIeeeFloatWaveFormat(44100, 2);
     private readonly List<IDisposable> _activeSources = [];
     private readonly Dictionary<string, PreloadedAudioClip> _preloadedClips = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _nonPreloadableAudioIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _preloadFailureCountsByCodec = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate = new();
     private readonly ViewerAudioSettings _settings;
+    private long _preloadedBytes;
+    private long _usageSerial;
 
     public ViewerAudioPlayer(ViewerAudioSettings settings)
     {
@@ -31,29 +37,67 @@ public sealed class ViewerAudioPlayer : IDisposable
         _output.Play();
     }
 
-    public int Preload(IEnumerable<ViewerAudioFile> files)
+    public int Preload(IEnumerable<ViewerAudioFile> files, bool writePerformanceLog = true)
     {
+        var fileList = files.ToList();
+        using var measure = writePerformanceLog
+            ? PerformanceLog.Measure($"ViewerAudioPlayer.Preload files={fileList.Count}")
+            : null;
         var count = 0;
-        foreach (var file in files)
+        long totalSamples = 0;
+        foreach (var file in fileList)
         {
             if (Preload(file))
             {
                 count++;
+                lock (_gate)
+                {
+                    if (_preloadedClips.TryGetValue(file.AudioId, out var clip))
+                    {
+                        totalSamples += clip.Samples.Length;
+                    }
+                }
             }
+        }
+
+        long cacheBytes;
+        lock (_gate)
+        {
+            cacheBytes = _preloadedBytes;
+        }
+
+        if (writePerformanceLog)
+        {
+            PerformanceLog.Mark($"ViewerAudioPlayer.Preload loaded={count} samples={totalSamples} approxBytes={totalSamples * sizeof(float)} cacheBytes={cacheBytes} failures={FormatPreloadFailureCounts()}");
         }
 
         return count;
     }
 
+    public bool PreloadOne(ViewerAudioFile file)
+    {
+        return Preload(file);
+    }
+
+    public bool IsPreloaded(string audioId)
+    {
+        lock (_gate)
+        {
+            return _preloadedClips.ContainsKey(audioId);
+        }
+    }
+
     public bool PlayPreloadedOneShot(string audioId, double delaySeconds)
     {
-        PreloadedAudioClip clip;
+        PreloadedAudioClip? clip;
         lock (_gate)
         {
             if (!_preloadedClips.TryGetValue(audioId, out clip))
             {
                 return false;
             }
+
+            clip.LastUsed = ++_usageSerial;
         }
 
         var source = new PreloadedSampleProvider(clip.Samples, clip.WaveFormat, RemoveDisposedSource);
@@ -85,7 +129,7 @@ public sealed class ViewerAudioPlayer : IDisposable
     {
         lock (_gate)
         {
-            if (_preloadedClips.ContainsKey(file.AudioId))
+            if (_preloadedClips.ContainsKey(file.AudioId) || _nonPreloadableAudioIds.Contains(file.AudioId))
             {
                 return false;
             }
@@ -96,16 +140,47 @@ public sealed class ViewerAudioPlayer : IDisposable
         {
             reader = CreateReader(file.FilePath);
             var sample = NormalizeFormat(reader.ToSampleProvider());
-            var samples = ReadAllSamples(sample);
+            if (!TryReadAllSamples(sample, out var samples))
+            {
+                lock (_gate)
+                {
+                    _nonPreloadableAudioIds.Add(file.AudioId);
+                    RegisterPreloadFailureLocked(file.FilePath);
+                }
+
+                return false;
+            }
+
+            var byteCount = samples.LongLength * sizeof(float);
             lock (_gate)
             {
-                _preloadedClips[file.AudioId] = new PreloadedAudioClip(samples, _mixFormat);
+                if (_preloadedClips.ContainsKey(file.AudioId) || _nonPreloadableAudioIds.Contains(file.AudioId))
+                {
+                    return false;
+                }
+
+                if (byteCount > MaxPreloadCacheBytes)
+                {
+                    _nonPreloadableAudioIds.Add(file.AudioId);
+                    RegisterPreloadFailureLocked(file.FilePath);
+                    return false;
+                }
+
+                EvictPreloadCacheFor(byteCount);
+                _preloadedClips[file.AudioId] = new PreloadedAudioClip(samples, _mixFormat, byteCount, ++_usageSerial);
+                _preloadedBytes += byteCount;
             }
 
             return true;
         }
         catch
         {
+            lock (_gate)
+            {
+                _nonPreloadableAudioIds.Add(file.AudioId);
+                RegisterPreloadFailureLocked(file.FilePath);
+            }
+
             return false;
         }
         finally
@@ -160,6 +235,9 @@ public sealed class ViewerAudioPlayer : IDisposable
         lock (_gate)
         {
             _preloadedClips.Clear();
+            _nonPreloadableAudioIds.Clear();
+            _preloadFailureCountsByCodec.Clear();
+            _preloadedBytes = 0;
         }
     }
 
@@ -176,6 +254,37 @@ public sealed class ViewerAudioPlayer : IDisposable
         {
             ".ogg" or ".oga" => new VorbisWaveReader(filePath),
             _ => new MediaFoundationReader(filePath)
+        };
+    }
+
+    private void RegisterPreloadFailureLocked(string filePath)
+    {
+        var codec = DetectCodecLabel(filePath);
+        _preloadFailureCountsByCodec[codec] = _preloadFailureCountsByCodec.GetValueOrDefault(codec) + 1;
+    }
+
+    private string FormatPreloadFailureCounts()
+    {
+        lock (_gate)
+        {
+            return _preloadFailureCountsByCodec.Count == 0
+                ? "none"
+                : string.Join(",", _preloadFailureCountsByCodec
+                    .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                    .Select(pair => $"{pair.Key}:{pair.Value}"));
+        }
+    }
+
+    private static string DetectCodecLabel(string filePath)
+    {
+        return Path.GetExtension(filePath).ToLowerInvariant() switch
+        {
+            ".wav" => "wav",
+            ".flac" => "flac",
+            ".ogg" or ".oga" => "ogg-vorbis",
+            ".mp3" => "mp3",
+            "" => "unknown",
+            var extension => extension.TrimStart('.')
         };
     }
 
@@ -205,7 +314,19 @@ public sealed class ViewerAudioPlayer : IDisposable
         }
     }
 
-    private static float[] ReadAllSamples(ISampleProvider source)
+    private void EvictPreloadCacheFor(long incomingBytes)
+    {
+        while (_preloadedBytes + incomingBytes > MaxPreloadCacheBytes && _preloadedClips.Count > 0)
+        {
+            var oldest = _preloadedClips
+                .OrderBy(pair => pair.Value.LastUsed)
+                .First();
+            _preloadedBytes -= oldest.Value.ByteCount;
+            _preloadedClips.Remove(oldest.Key);
+        }
+    }
+
+    private static bool TryReadAllSamples(ISampleProvider source, out float[] samples)
     {
         var result = new List<float>();
         var maxSamples = source.WaveFormat.SampleRate * source.WaveFormat.Channels * MaxPreloadSeconds;
@@ -220,7 +341,8 @@ public sealed class ViewerAudioPlayer : IDisposable
 
             if (result.Count + read > maxSamples)
             {
-                throw new InvalidOperationException($"preload limit exceeded ({MaxPreloadSeconds}s)");
+                samples = [];
+                return false;
             }
 
             for (var i = 0; i < read; i++)
@@ -229,7 +351,8 @@ public sealed class ViewerAudioPlayer : IDisposable
             }
         }
 
-        return result.ToArray();
+        samples = result.ToArray();
+        return true;
     }
 }
 
@@ -283,7 +406,16 @@ internal sealed class PreloadedSampleProvider : ISampleProvider, IDisposable
     }
 }
 
-internal readonly record struct PreloadedAudioClip(float[] Samples, WaveFormat WaveFormat);
+internal sealed class PreloadedAudioClip(float[] samples, WaveFormat waveFormat, long byteCount, long lastUsed)
+{
+    public float[] Samples { get; } = samples;
+
+    public WaveFormat WaveFormat { get; } = waveFormat;
+
+    public long ByteCount { get; } = byteCount;
+
+    public long LastUsed { get; set; } = lastUsed;
+}
 
 public readonly record struct ViewerAudioSettings(float AudioVolume, float MasterGain, float LimiterThreshold);
 

@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Text.Json;
 using NBMS.Core.Import;
 using NBMS.Core.Models;
 using NBMS.Core.Services;
@@ -10,7 +11,7 @@ public sealed class BmsConversionService
 {
     private readonly BmsImportService _importService = new();
     private readonly HashService _hashService = new();
-    private static readonly string[] BmsPatterns = ["*.bms", "*.bme", "*.bml", "*.pms", "*.oct", "*.fp", "*.ibmsc"];
+    private static readonly string[] BmsPatterns = ["*.bms", "*.bme", "*.bml", "*.pms", "*.oct", "*.fp", "*.ibmsc", "*.Divergence", "*.divergence"];
 
     public async Task<BmsConversionResult> ConvertAsync(
         string bmsPath,
@@ -18,6 +19,7 @@ public sealed class BmsConversionService
         BmsConversionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        using var measure = PerformanceLog.Measure($"Converter.Convert file={Path.GetFileName(bmsPath)}");
         var importResult = await _importService.ImportAsync(bmsPath, options?.EncodingName, cancellationToken);
         var outputRoot = Path.GetFullPath(outputDirectory);
         var scoreDirectory = Path.Combine(outputRoot, "score");
@@ -54,6 +56,7 @@ public sealed class BmsConversionService
         importResult.Header.Charts[0].HashAlgorithm = "sha256-compact-canonical-json";
         importResult.Header.Audio.Hash = await _hashService.ComputeFileSha256Async(audioPath, cancellationToken);
         await NbmsJson.WriteAsync(headerPath, importResult.Header, cancellationToken);
+        AddCompatibilityReport(imported.ImportReport, importResult);
 
         return new BmsConversionResult(headerPath, chartPath, audioPath)
         {
@@ -67,6 +70,7 @@ public sealed class BmsConversionService
         BmsFolderConversionOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        using var measure = PerformanceLog.Measure($"Converter.ConvertFolder source={Path.GetFileName(Path.TrimEndingDirectorySeparator(bmsDirectory))}");
         var sourceRoot = Path.GetFullPath(bmsDirectory);
         var outputRoot = Path.GetFullPath(outputDirectory);
         var scoreDirectory = Path.Combine(outputRoot, "score");
@@ -132,6 +136,7 @@ public sealed class BmsConversionService
                 HashAlgorithm = "sha256-compact-canonical-json"
             });
 
+            AddCompatibilityReport(imported.ImportReport, imported.ImportResult);
             results.Add(new BmsConversionResult(headerPath, chartPath, audioPath)
             {
                 ImportReport = imported.ImportReport.ToList()
@@ -188,7 +193,7 @@ public sealed class BmsConversionService
                     chart.Timing.Count(timing => timing.Type == "bpm"),
                     chart.Timing.Count(timing => timing.Type == "stop"),
                     chart.Notes.Count(note => note.Type == "hold"),
-                    chart.Timing.FirstOrDefault(timing => timing.Type == "lnobj")?.Event ?? "");
+                    imported.ImportResult.CompatibilityReport.LnObj);
             })
             .ToList();
 
@@ -355,6 +360,102 @@ public sealed class BmsConversionService
         return sources;
     }
 
+    private static void AddCompatibilityReport(List<string> report, BmsImportResult importResult)
+    {
+        var chart = importResult.Chart;
+        var compatibility = importResult.CompatibilityReport;
+        var bmsCompat = TryGetBmsCompat(chart.Metadata);
+        var sourceEncoding = TryGetString(bmsCompat, "sourceEncoding");
+        var encodingDetection = TryGetString(bmsCompat, "encodingDetection");
+        var charsetDirective = TryGetString(bmsCompat, "charsetDirective");
+        var scrollCount = chart.Timing.Count(item => item.Type.Equals("scroll", StringComparison.OrdinalIgnoreCase));
+        var speedCount = chart.Timing.Count(item => item.Type.Equals("speed", StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrWhiteSpace(sourceEncoding))
+        {
+            var suffix = string.IsNullOrWhiteSpace(encodingDetection) ? "" : $" / {encodingDetection}";
+            report.Add($"encoding detected: {sourceEncoding}{suffix}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(charsetDirective))
+        {
+            report.Add($"charset directive: {charsetDirective}");
+        }
+
+        report.Add($"audio definitions: {importResult.WavFiles.Count}");
+        report.Add($"media definitions: {importResult.MediaFiles.Count}");
+        report.Add($"timing events: bpm={chart.Timing.Count(item => item.Type.Equals("bpm", StringComparison.OrdinalIgnoreCase))}, stop={chart.Timing.Count(item => item.Type.Equals("stop", StringComparison.OrdinalIgnoreCase))}, scroll={scrollCount}, speed={speedCount}");
+
+        if (scrollCount > 0)
+        {
+            report.Add($"SCROLL detected: {scrollCount} event(s), stored as nbms.scroll");
+        }
+
+        if (speedCount > 0)
+        {
+            report.Add($"SPEED detected: {speedCount} event(s)");
+        }
+
+        if (!string.IsNullOrWhiteSpace(compatibility.LnObj))
+        {
+            report.Add($"LNOBJ detected: {compatibility.LnObj}, stored as bms compatibility metadata");
+        }
+
+        if (compatibility.RandomPreserved || compatibility.BranchNotExpanded)
+        {
+            report.Add("RANDOM/IF directives preserved only; branches are not expanded during import");
+        }
+
+        if (compatibility.UnsupportedDirectives.Count > 0)
+        {
+            report.Add($"unsupported directives: {string.Join(", ", compatibility.UnsupportedDirectives.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(item => item, StringComparer.OrdinalIgnoreCase))}");
+        }
+
+        foreach (var warning in EnumerateStringArray(bmsCompat, "encodingWarnings"))
+        {
+            report.Add($"encoding warning: {warning}");
+        }
+    }
+
+    private static JsonElement? TryGetBmsCompat(JsonElement? metadata)
+    {
+        if (metadata is { ValueKind: JsonValueKind.Object } value &&
+            value.TryGetProperty("bmsCompat", out var bmsCompat) &&
+            bmsCompat.ValueKind == JsonValueKind.Object)
+        {
+            return bmsCompat;
+        }
+
+        return null;
+    }
+
+    private static string? TryGetString(JsonElement? element, string propertyName)
+    {
+        return element is { ValueKind: JsonValueKind.Object } value &&
+               value.TryGetProperty(propertyName, out var property) &&
+               property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+    }
+
+    private static IEnumerable<string> EnumerateStringArray(JsonElement? element, string propertyName)
+    {
+        if (element is not { ValueKind: JsonValueKind.Object } value ||
+            !value.TryGetProperty(propertyName, out var property) ||
+            property.ValueKind != JsonValueKind.Array)
+        {
+            yield break;
+        }
+
+        foreach (var item in property.EnumerateArray())
+        {
+            if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+            {
+                yield return item.GetString()!;
+            }
+        }
+    }
+
     private static void RemapChartAudioIds(NbmsChart chart, IReadOnlyDictionary<string, string> audioIdMap)
     {
         foreach (var note in chart.Notes)
@@ -390,6 +491,7 @@ public sealed class BmsConversionService
         string audioPath,
         CancellationToken cancellationToken)
     {
+        using var measure = PerformanceLog.Measure($"Converter.CreateAudioArchive entries={audioSources.Count}");
         Directory.CreateDirectory(Path.GetDirectoryName(audioPath)!);
         await using var stream = File.Create(audioPath);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
@@ -414,13 +516,16 @@ public sealed class BmsConversionService
 
         foreach (var source in audioSources.OrderBy(source => source.AudioId, StringComparer.Ordinal))
         {
+            using var entryMeasure = PerformanceLog.Measure(
+                $"Converter.AudioEntry id={source.AudioId} file={Path.GetFileName(source.SourcePath)}",
+                minimumElapsedMs: 50);
             var archivePath = $"audio/{source.AudioId}{Path.GetExtension(source.OriginalFileName).ToLowerInvariant()}";
             var codec = DetectCodec(source.OriginalFileName);
             var metadata = AudioMetadataReader.TryRead(source.SourcePath);
 
             if (File.Exists(source.SourcePath))
             {
-                archive.CreateEntryFromFile(source.SourcePath, archivePath, CompressionLevel.Optimal);
+                archive.CreateEntryFromFile(source.SourcePath, archivePath, ArchiveCompressionPolicy.ForAssetPath(archivePath));
             }
 
             manifest.Entries.Add(new AudioEntry
@@ -470,6 +575,7 @@ public sealed class BmsConversionService
         string mediaPath,
         CancellationToken cancellationToken)
     {
+        using var measure = PerformanceLog.Measure($"Converter.CreateMediaArchive entries={mediaSources.Count}");
         Directory.CreateDirectory(Path.GetDirectoryName(mediaPath)!);
         await using var stream = File.Create(mediaPath);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
@@ -482,13 +588,16 @@ public sealed class BmsConversionService
 
         foreach (var source in mediaSources.OrderBy(source => source.MediaId, StringComparer.Ordinal))
         {
+            using var entryMeasure = PerformanceLog.Measure(
+                $"Converter.MediaEntry id={source.MediaId} file={Path.GetFileName(source.SourcePath)}",
+                minimumElapsedMs: 50);
             var extension = Path.GetExtension(source.OriginalFileName).ToLowerInvariant();
             var archivePath = $"media/{source.MediaId}{extension}";
             var metadata = MediaMetadataReader.TryRead(source.SourcePath);
 
             if (File.Exists(source.SourcePath))
             {
-                archive.CreateEntryFromFile(source.SourcePath, archivePath, CompressionLevel.Optimal);
+                archive.CreateEntryFromFile(source.SourcePath, archivePath, ArchiveCompressionPolicy.ForAssetPath(archivePath));
             }
 
             manifest.Entries.Add(new MediaAssetEntry
